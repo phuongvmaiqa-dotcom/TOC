@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>TOC Monitoring Dashboard</title>
+
+<!-- React -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<!-- Babel: cho phép viết JSX trực tiếp trong file HTML, browser tự compile -->
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- Recharts (biểu đồ) -->
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<!-- Lucide icons -->
+<script src="https://unpkg.com/lucide@0.263.1/dist/umd/lucide.js"></script>
+
+<style>
+  body { margin: 0; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .spin { animation: spin 1s linear infinite; display: inline-flex; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+const {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  ReferenceLine, Scatter, ComposedChart
+} = Recharts;
+
+// ============================================================
+// CẤU HÌNH SUPABASE — sửa 2 dòng dưới nếu bạn đổi project Supabase
+// ============================================================
+const SUPABASE_URL = 'https://fegayqatcpmvbuuzzjzw.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_BrE8lu-Qjj4uA-auK4T5jw_7Q_uNUOF';
+
+const REST_BASE = `${SUPABASE_URL}/rest/v1`;
+const HEADERS = {
+  apikey: SUPABASE_ANON_KEY,
+  Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+};
+
+// ============================================================
+// CẤU HÌNH HIỂN THỊ
+// ============================================================
+const WATER_TYPES = [
+  { key: 'distilled', label: 'Nước cất (Distilled Water)', iconName: 'droplet', accent: '#2563eb' },
+  { key: 'purified', label: 'Nước tinh khiết (Purified Water)', iconName: 'droplet', accent: '#0891b2' },
+];
+
+const METRICS = [
+  { key: 'toc', label: 'TOC', unit: 'ppb', iconName: 'activity', hasSpec: true },
+  { key: 'conductivity', label: 'Độ dẫn điện', unit: 'µS/cm', iconName: 'zap', hasSpec: false },
+  { key: 'temperature', label: 'Nhiệt độ', unit: '°C', iconName: 'thermometer', hasSpec: false },
+];
+
+const RANGE_PRESETS = [
+  { key: '24h', label: '24 giờ', hours: 24 },
+  { key: '7d', label: '7 ngày', hours: 24 * 7 },
+  { key: '30d', label: '30 ngày', hours: 24 * 30 },
+];
+
+function fmtNum(v, digits = 2) {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—';
+  return Number(v).toFixed(digits);
+}
+
+function fmtDateShort(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString('vi-VN', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+}
+
+// Icon component nhỏ dùng lucide UMD (render bằng innerHTML SVG có sẵn)
+function Icon({ name, size = 16, color = 'currentColor' }) {
+  const ref = React.useRef(null);
+  useEffect(() => {
+    if (ref.current && window.lucide && window.lucide.icons[toPascal(name)]) {
+      ref.current.innerHTML = '';
+      const svg = window.lucide.createElement(window.lucide.icons[toPascal(name)]);
+      ref.current.appendChild(svg);
+    }
+  }, [name]);
+  function toPascal(s) {
+    return s.split('-').map(p => p[0].toUpperCase() + p.slice(1)).join('');
+  }
+  return <span ref={ref} style={{ width: size, height: size, display: 'inline-flex', color }} />;
+}
+
+// ============================================================
+// HOOK: lấy dữ liệu stats hourly theo khoảng thời gian
+// ============================================================
+function useStatsData(uuid, fromIso, toIso) {
+  const [data, setData] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const refresh = useCallback(() => setRefreshKey(k => k + 1), []);
+
+  useEffect(() => {
+    if (!uuid) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+
+    const url = `${REST_BASE}/toc_stats_hourly?uuid=eq.${encodeURIComponent(uuid)}` +
+      `&bucket_hour=gte.${encodeURIComponent(fromIso)}` +
+      `&bucket_hour=lte.${encodeURIComponent(toIso)}` +
+      `&order=bucket_hour.asc&limit=5000`;
+
+    fetch(url, { headers: HEADERS })
+      .then(async (res) => {
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+        }
+        return res.json();
+      })
+      .then((rows) => {
+        if (cancelled) return;
+        const grouped = {};
+        for (const r of rows) {
+          const k = `${r.water_type}_${r.metric}`;
+          if (!grouped[k]) grouped[k] = [];
+          grouped[k].push(r);
+        }
+        setData(grouped);
+        setLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(err.message || String(err));
+        setLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [uuid, fromIso, toIso, refreshKey]);
+
+  return { data, loading, error, refresh };
+}
+
+// ============================================================
+// HOOK: lấy danh sách devices
+// ============================================================
+function useDevices() {
+  const [devices, setDevices] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    fetch(`${REST_BASE}/toc_devices?select=*&order=location_name.asc`, { headers: HEADERS })
+      .then(async (res) => {
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+        }
+        return res.json();
+      })
+      .then((rows) => { setDevices(rows); setLoading(false); })
+      .catch((err) => { setError(err.message || String(err)); setLoading(false); });
+  }, []);
+
+  return { devices, loading, error };
+}
+
+// ============================================================
+// Tính thống kê tổng hợp cho cả khoảng thời gian (từ các dòng hourly)
+// ============================================================
+function aggregateStats(rows) {
+  if (!rows || !rows.length) return null;
+  const validRows = rows.filter(r => r.avg_val !== null && r.n_points > 0);
+  if (!validRows.length) return null;
+
+  const totalPoints = validRows.reduce((s, r) => s + (r.n_points || 0), 0);
+  const totalExpected = rows.reduce((s, r) => s + (r.n_expected || 0), 0);
+  const missRate = totalExpected > 0 ? ((totalExpected - totalPoints) / totalExpected) * 100 : null;
+
+  const allMins = validRows.map(r => r.min_val).filter(v => v !== null);
+  const allMaxs = validRows.map(r => r.max_val).filter(v => v !== null);
+  const weightedSum = validRows.reduce((s, r) => s + (r.avg_val * r.n_points), 0);
+  const grandAvg = totalPoints > 0 ? weightedSum / totalPoints : null;
+
+  const q1s = validRows.map(r => r.q1_val).filter(v => v !== null);
+  const q3s = validRows.map(r => r.q3_val).filter(v => v !== null);
+  const avgQ1 = q1s.length ? q1s.reduce((a, b) => a + b, 0) / q1s.length : null;
+  const avgQ3 = q3s.length ? q3s.reduce((a, b) => a + b, 0) / q3s.length : null;
+
+  const sds = validRows.map(r => r.stddev_val).filter(v => v !== null && !Number.isNaN(v));
+  const avgSd = sds.length ? Math.sqrt(sds.reduce((a, b) => a + b * b, 0) / sds.length) : null;
+
+  const specViolations = validRows.reduce((s, r) => s + (r.n_spec_violation || 0), 0);
+  const specLimit = validRows.find(r => r.spec_limit !== null)?.spec_limit ?? null;
+
+  return {
+    min: allMins.length ? Math.min(...allMins) : null,
+    max: allMaxs.length ? Math.max(...allMaxs) : null,
+    mean: grandAvg,
+    sd: avgSd,
+    q1: avgQ1,
+    q3: avgQ3,
+    iqr: (avgQ1 !== null && avgQ3 !== null) ? avgQ3 - avgQ1 : null,
+    missRate,
+    totalPoints,
+    totalExpected,
+    specViolations,
+    specLimit,
+    nHours: validRows.length,
+    nHoursExpected: rows.length,
+  };
+}
+
+// ============================================================
+// COMPONENT: Card thống kê
+// ============================================================
+function StatCard({ label, value, unit, highlight }) {
+  return (
+    <div style={{
+      background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8,
+      padding: '10px 14px', minWidth: 92, flex: '1 1 92px'
+    }}>
+      <div style={{ fontSize: 11, color: '#64748b', fontWeight: 600, letterSpacing: '0.02em', textTransform: 'uppercase' }}>{label}</div>
+      <div style={{
+        fontFamily: "'JetBrains Mono', 'Courier New', monospace",
+        fontSize: 20, fontWeight: 700, marginTop: 2,
+        color: highlight || '#0f172a'
+      }}>
+        {value}{unit ? <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b', marginLeft: 3 }}>{unit}</span> : null}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// COMPONENT: Khối biểu đồ cho 1 (water_type, metric)
+// ============================================================
+function MetricBlock({ waterType, metric, rows, loading }) {
+  const stats = useMemo(() => aggregateStats(rows), [rows]);
+
+  const chartData = useMemo(() => {
+    if (!rows) return [];
+    return rows.map(r => ({
+      time: r.bucket_hour,
+      timeLabel: fmtDateShort(r.bucket_hour),
+      avg: r.avg_val,
+      min: r.min_val,
+      max: r.max_val,
+      ucl: r.ucl_val,
+      lcl: r.lcl_val,
+      specLimit: r.spec_limit,
+      violation: (r.spec_limit !== null && r.avg_val !== null && r.avg_val > r.spec_limit) ? r.avg_val : null,
+      missRate: r.miss_rate_pct,
+    }));
+  }, [rows]);
+
+  const hasData = chartData.length > 0 && stats;
+
+  return (
+    <div style={{
+      background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 12,
+      padding: 20, marginBottom: 20
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
+        <Icon name={metric.iconName} size={18} color={waterType.accent} />
+        <h3 style={{ margin: 0, fontSize: 15, fontWeight: 700, color: '#0f172a' }}>
+          {metric.label}
+        </h3>
+        <span style={{ fontSize: 12, color: '#94a3b8' }}>({metric.unit})</span>
+        {stats && stats.specViolations > 0 && (
+          <span style={{
+            display: 'inline-flex', alignItems: 'center', gap: 4,
+            background: '#fef2f2', color: '#dc2626', fontSize: 11, fontWeight: 700,
+            padding: '2px 8px', borderRadius: 999, marginLeft: 'auto'
+          }}>
+            <Icon name="alert-triangle" size={11} /> {stats.specViolations} vi phạm spec
+          </span>
+        )}
+      </div>
+
+      {loading && <div style={{ color: '#94a3b8', fontSize: 13, padding: 20, textAlign: 'center' }}>Đang tải dữ liệu...</div>}
+
+      {!loading && !hasData && (
+        <div style={{ color: '#94a3b8', fontSize: 13, padding: 20, textAlign: 'center' }}>
+          Không có dữ liệu trong khoảng thời gian này.
+        </div>
+      )}
+
+      {!loading && hasData && (
+        <React.Fragment>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
+            <StatCard label="Min" value={fmtNum(stats.min)} unit={metric.unit} />
+            <StatCard label="Max" value={fmtNum(stats.max)} unit={metric.unit} />
+            <StatCard label="Trung bình" value={fmtNum(stats.mean)} unit={metric.unit} />
+            <StatCard label="Độ lệch chuẩn" value={fmtNum(stats.sd)} unit={metric.unit} />
+            <StatCard label="Q1" value={fmtNum(stats.q1)} unit={metric.unit} />
+            <StatCard label="Q3" value={fmtNum(stats.q3)} unit={metric.unit} />
+            <StatCard label="IQR" value={fmtNum(stats.iqr)} unit={metric.unit} />
+            <StatCard
+              label="% Thiếu dữ liệu"
+              value={fmtNum(stats.missRate, 1)}
+              unit="%"
+              highlight={stats.missRate > 10 ? '#dc2626' : stats.missRate > 2 ? '#d97706' : '#16a34a'}
+            />
+            {metric.hasSpec && (
+              <StatCard
+                label="Vi phạm Spec"
+                value={stats.specViolations}
+                unit={`/ ${stats.totalPoints} điểm`}
+                highlight={stats.specViolations > 0 ? '#dc2626' : '#16a34a'}
+              />
+            )}
+          </div>
+
+          <div style={{ marginBottom: 18 }}>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 }}>
+              Xu hướng theo thời gian (giá trị trung bình mỗi giờ)
+            </div>
+            <ResponsiveContainer width="100%" height={180}>
+              <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey="timeLabel" tick={{ fontSize: 10, fill: '#94a3b8' }} interval="preserveStartEnd" minTickGap={40} />
+                <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={45} domain={['auto', 'auto']} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
+                  formatter={(v) => [fmtNum(v), metric.unit]}
+                />
+                {metric.hasSpec && stats.specLimit !== null && (
+                  <ReferenceLine y={stats.specLimit} stroke="#dc2626" strokeDasharray="4 4"
+                    label={{ value: `Spec limit: ${stats.specLimit}`, position: 'insideTopRight', fontSize: 10, fill: '#dc2626' }} />
+                )}
+                <Line type="monotone" dataKey="avg" stroke={waterType.accent} strokeWidth={2} dot={false} name="Trung bình" />
+                <Line type="monotone" dataKey="max" stroke="#cbd5e1" strokeWidth={1} dot={false} name="Max" strokeDasharray="2 2" />
+                <Line type="monotone" dataKey="min" stroke="#cbd5e1" strokeWidth={1} dot={false} name="Min" strokeDasharray="2 2" />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 }}>
+              Biểu đồ kiểm soát (Control Chart — UCL/LCL = mean ± 3σ)
+            </div>
+            <ResponsiveContainer width="100%" height={180}>
+              <ComposedChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                <XAxis dataKey="timeLabel" tick={{ fontSize: 10, fill: '#94a3b8' }} interval="preserveStartEnd" minTickGap={40} />
+                <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={45} domain={['auto', 'auto']} />
+                <Tooltip
+                  contentStyle={{ fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }}
+                  formatter={(v, name) => [fmtNum(v), name]}
+                />
+                <Line type="monotone" dataKey="ucl" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="UCL" strokeDasharray="5 3" />
+                <Line type="monotone" dataKey="lcl" stroke="#f59e0b" strokeWidth={1.5} dot={false} name="LCL" strokeDasharray="5 3" />
+                <Line type="monotone" dataKey="avg" stroke={waterType.accent} strokeWidth={2} dot={{ r: 2 }} name="Giá trị" />
+                {metric.hasSpec && (
+                  <Scatter dataKey="violation" fill="#dc2626" name="Vi phạm Spec" shape="diamond" />
+                )}
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// COMPONENT: Header với bộ lọc thời gian
+// ============================================================
+function FilterBar({ devices, selectedUuid, onSelectUuid, rangeKey, onRangeChange, customFrom, customTo, onCustomChange, onRefresh, loading }) {
+  const isCustom = rangeKey === 'custom';
+
+  return (
+    <div style={{
+      background: '#0f172a', borderRadius: 12, padding: '16px 20px',
+      display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14, marginBottom: 24
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, color: '#fff', fontWeight: 700, fontSize: 15, marginRight: 8 }}>
+        <Icon name="activity" size={18} color="#38bdf8" />
+        TOC Monitoring
+      </div>
+
+      <select
+        value={selectedUuid || ''}
+        onChange={(e) => onSelectUuid(e.target.value)}
+        style={{
+          background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155',
+          borderRadius: 6, padding: '6px 10px', fontSize: 13
+        }}
+      >
+        {devices.map(d => (
+          <option key={d.uuid} value={d.uuid}>
+            {d.location_name || d.model || d.uuid} ({d.uuid})
+          </option>
+        ))}
+      </select>
+
+      <div style={{ display: 'flex', gap: 4 }}>
+        {RANGE_PRESETS.map(p => (
+          <button
+            key={p.key}
+            onClick={() => onRangeChange(p.key)}
+            style={{
+              background: rangeKey === p.key ? '#38bdf8' : '#1e293b',
+              color: rangeKey === p.key ? '#0f172a' : '#94a3b8',
+              border: 'none', borderRadius: 6, padding: '6px 12px',
+              fontSize: 12, fontWeight: 600, cursor: 'pointer'
+            }}
+          >
+            {p.label}
+          </button>
+        ))}
+        <button
+          onClick={() => onRangeChange('custom')}
+          style={{
+            background: isCustom ? '#38bdf8' : '#1e293b',
+            color: isCustom ? '#0f172a' : '#94a3b8',
+            border: 'none', borderRadius: 6, padding: '6px 10px',
+            fontSize: 12, fontWeight: 600, cursor: 'pointer',
+            display: 'flex', alignItems: 'center', gap: 4
+          }}
+        >
+          <Icon name="calendar" size={12} /> Tùy chọn
+        </button>
+      </div>
+
+      {isCustom && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input
+            type="datetime-local"
+            value={customFrom}
+            onChange={(e) => onCustomChange('from', e.target.value)}
+            style={{ background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
+          />
+          <span style={{ color: '#64748b', fontSize: 12 }}>→</span>
+          <input
+            type="datetime-local"
+            value={customTo}
+            onChange={(e) => onCustomChange('to', e.target.value)}
+            style={{ background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
+          />
+        </div>
+      )}
+
+      <button
+        onClick={onRefresh}
+        style={{
+          marginLeft: 'auto', background: '#1e293b', color: '#38bdf8', border: '1px solid #334155',
+          borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
+          display: 'flex', alignItems: 'center', gap: 6
+        }}
+      >
+        <span className={loading ? 'spin' : ''}><Icon name="refresh-cw" size={13} /></span> Tải lại
+      </button>
+    </div>
+  );
+}
+
+// ============================================================
+// APP CHÍNH
+// ============================================================
+function TocDashboard() {
+  const { devices, loading: devicesLoading, error: devicesError } = useDevices();
+  const [selectedUuid, setSelectedUuid] = useState(null);
+  const [rangeKey, setRangeKey] = useState('7d');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+
+  useEffect(() => {
+    if (devices.length && !selectedUuid) setSelectedUuid(devices[0].uuid);
+  }, [devices, selectedUuid]);
+
+  const { fromIso, toIso } = useMemo(() => {
+    if (rangeKey === 'custom' && customFrom && customTo) {
+      return { fromIso: new Date(customFrom).toISOString(), toIso: new Date(customTo).toISOString() };
+    }
+    const preset = RANGE_PRESETS.find(p => p.key === rangeKey) || RANGE_PRESETS[1];
+    const to = new Date();
+    const from = new Date(to.getTime() - preset.hours * 3600 * 1000);
+    return { fromIso: from.toISOString(), toIso: to.toISOString() };
+  }, [rangeKey, customFrom, customTo]);
+
+  const { data, loading, error, refresh } = useStatsData(selectedUuid, fromIso, toIso);
+
+  const handleCustomChange = (which, val) => {
+    if (which === 'from') setCustomFrom(val);
+    else setCustomTo(val);
+  };
+
+  return (
+    <div style={{
+      background: '#fff', minHeight: '100vh', padding: 20, color: '#0f172a'
+    }}>
+      <FilterBar
+        devices={devices}
+        selectedUuid={selectedUuid}
+        onSelectUuid={setSelectedUuid}
+        rangeKey={rangeKey}
+        onRangeChange={setRangeKey}
+        customFrom={customFrom}
+        customTo={customTo}
+        onCustomChange={handleCustomChange}
+        onRefresh={refresh}
+        loading={loading}
+      />
+
+      {devicesError && (
+        <div style={{ background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 }}>
+          Lỗi tải danh sách thiết bị: {devicesError}
+        </div>
+      )}
+
+      {error && (
+        <div style={{ background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 }}>
+          Lỗi tải dữ liệu: {error}
+        </div>
+      )}
+
+      {devicesLoading && (
+        <div style={{ textAlign: 'center', color: '#94a3b8', padding: 40 }}>Đang tải danh sách thiết bị...</div>
+      )}
+
+      {!devicesLoading && devices.length === 0 && !devicesError && (
+        <div style={{ textAlign: 'center', color: '#94a3b8', padding: 40 }}>
+          Chưa có thiết bị nào trong hệ thống. Hãy chạy workflow đồng bộ devices trước.
+        </div>
+      )}
+
+      {selectedUuid && WATER_TYPES.map(wt => (
+        <div key={wt.key} style={{ marginBottom: 32 }}>
+          <h2 style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            fontSize: 18, fontWeight: 800, color: wt.accent,
+            borderBottom: `2px solid ${wt.accent}`, paddingBottom: 8, marginBottom: 16
+          }}>
+            <Icon name={wt.iconName} size={20} color={wt.accent} />
+            {wt.label}
+          </h2>
+          {METRICS.map(m => (
+            <MetricBlock
+              key={`${wt.key}_${m.key}`}
+              waterType={wt}
+              metric={m}
+              rows={data[`${wt.key}_${m.key}`]}
+              loading={loading}
+            />
+          ))}
+        </div>
+      ))}
+
+      <div style={{ textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' }}>
+        Dữ liệu từ Supabase · Cập nhật tự động mỗi giờ qua n8n
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<TocDashboard />);
+</script>
+</body>
+</html>
