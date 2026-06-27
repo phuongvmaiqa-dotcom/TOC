@@ -56,6 +56,9 @@ const RANGE_PRESETS = [
   { key: '30d', label: '30 ngày', hours: 24 * 30 },
 ];
 
+// Ngưỡng kỹ thuật cố định cho TOC (ppb) — khớp với toc_cau_hinh.toc_spec_limit_ppb trong Supabase
+const TOC_SPEC_LIMIT = 500;
+
 function fmtNum(v, digits = 2) {
   if (v === null || v === undefined || Number.isNaN(v)) return '—';
   return Number(v).toFixed(digits);
@@ -67,13 +70,38 @@ function fmtDateShort(iso) {
 }
 
 // ============================================================
-// HOOK: lấy dữ liệu stats hourly theo khoảng thời gian
+// HOOK: lấy dữ liệu THÔ (1 điểm đo/phút) theo khoảng thời gian
+// Tự phân trang để vượt giới hạn mặc định 1000 dòng/request của PostgREST
 // ============================================================
-function useStatsData(uuid, fromIso, toIso) {
-  const [data, setData] = useState({});
+async function fetchAllRows(uuid, fromIso, toIso) {
+  const PAGE_SIZE = 1000;
+  let allRows = [];
+  let offset = 0;
+  while (true) {
+    const url = `${REST_BASE}/toc_data_raw?uuid=eq.${encodeURIComponent(uuid)}` +
+      `&device_timestamp=gte.${encodeURIComponent(fromIso)}` +
+      `&device_timestamp=lte.${encodeURIComponent(toIso)}` +
+      `&order=device_timestamp.asc&limit=${PAGE_SIZE}&offset=${offset}`;
+    const res = await fetch(url, { headers: HEADERS });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+    }
+    const rows = await res.json();
+    allRows = allRows.concat(rows);
+    if (rows.length < PAGE_SIZE) break; // hết dữ liệu
+    offset += PAGE_SIZE;
+    if (offset > 200000) break; // an toàn, tránh lặp vô hạn nếu có lỗi
+  }
+  return allRows;
+}
+
+function useRawData(uuid, fromIso, toIso) {
+  const [rawRows, setRawRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [loadedCount, setLoadedCount] = useState(0);
 
   const refresh = useCallback(() => setRefreshKey(k => k + 1), []);
 
@@ -82,29 +110,13 @@ function useStatsData(uuid, fromIso, toIso) {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setLoadedCount(0);
 
-    const url = `${REST_BASE}/toc_stats_hourly?uuid=eq.${encodeURIComponent(uuid)}` +
-      `&bucket_hour=gte.${encodeURIComponent(fromIso)}` +
-      `&bucket_hour=lte.${encodeURIComponent(toIso)}` +
-      `&order=bucket_hour.asc&limit=5000`;
-
-    fetch(url, { headers: HEADERS })
-      .then(async (res) => {
-        if (!res.ok) {
-          const txt = await res.text();
-          throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
-        }
-        return res.json();
-      })
+    fetchAllRows(uuid, fromIso, toIso)
       .then((rows) => {
         if (cancelled) return;
-        const grouped = {};
-        for (const r of rows) {
-          const k = `${r.water_type}_${r.metric}`;
-          if (!grouped[k]) grouped[k] = [];
-          grouped[k].push(r);
-        }
-        setData(grouped);
+        setRawRows(rows);
+        setLoadedCount(rows.length);
         setLoading(false);
       })
       .catch((err) => {
@@ -116,7 +128,23 @@ function useStatsData(uuid, fromIso, toIso) {
     return () => { cancelled = true; };
   }, [uuid, fromIso, toIso, refreshKey]);
 
-  return { data, loading, error, refresh };
+  return { rawRows, loading, error, refresh, loadedCount };
+}
+
+// Map field tên cột raw theo (water_type, metric)
+const RAW_FIELD_MAP = {
+  distilled_toc: 'dw_toc',
+  distilled_conductivity: 'dw_conductivity',
+  distilled_temperature: 'dw_temperature',
+  purified_toc: 'pw_toc',
+  purified_conductivity: 'pw_conductivity',
+  purified_temperature: 'pw_temperature',
+};
+
+// Tính số điểm "kỳ vọng" trong khoảng thời gian (1 điểm/phút)
+function expectedCount(fromIso, toIso) {
+  const ms = new Date(toIso).getTime() - new Date(fromIso).getTime();
+  return Math.max(1, Math.round(ms / 60000));
 }
 
 // ============================================================
@@ -144,40 +172,69 @@ function useDevices() {
 }
 
 // ============================================================
-// Tính thống kê tổng hợp cho cả khoảng thời gian
+// Trích danh sách điểm {time, value} cho 1 (water_type, metric) từ rawRows
 // ============================================================
-function aggregateStats(rows) {
-  if (!rows || !rows.length) return null;
-  const validRows = rows.filter(r => r.avg_val !== null && r.n_points > 0);
-  if (!validRows.length) return null;
+function extractSeries(rawRows, waterType, metricKey, specLimit) {
+  const field = RAW_FIELD_MAP[`${waterType}_${metricKey}`];
+  const points = [];
+  for (const r of rawRows) {
+    const v = r[field];
+    points.push({
+      time: r.device_timestamp,
+      timeLabel: fmtDateShort(r.device_timestamp),
+      value: (v === null || v === undefined) ? null : Number(v),
+    });
+  }
+  return points;
+}
 
-  const totalPoints = validRows.reduce((s, r) => s + (r.n_points || 0), 0);
-  const totalExpected = rows.reduce((s, r) => s + (r.n_expected || 0), 0);
-  const missRate = totalExpected > 0 ? ((totalExpected - totalPoints) / totalExpected) * 100 : null;
+// ============================================================
+// Tính percentile tuyến tính (giống PERCENTILE_CONT của Postgres)
+// ============================================================
+function percentile(sortedArr, p) {
+  if (!sortedArr.length) return null;
+  const idx = (sortedArr.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sortedArr[lo];
+  return sortedArr[lo] + (sortedArr[hi] - sortedArr[lo]) * (idx - lo);
+}
 
-  const allMins = validRows.map(r => r.min_val).filter(v => v !== null);
-  const allMaxs = validRows.map(r => r.max_val).filter(v => v !== null);
-  const weightedSum = validRows.reduce((s, r) => s + (r.avg_val * r.n_points), 0);
-  const grandAvg = totalPoints > 0 ? weightedSum / totalPoints : null;
+// ============================================================
+// Tính thống kê tổng hợp trực tiếp từ mảng điểm thô {time, value}
+// ============================================================
+function aggregateStatsRaw(points, specLimit, expCount) {
+  if (!points || !points.length) return null;
+  const values = points.map(p => p.value).filter(v => v !== null && !Number.isNaN(v));
+  const n = values.length;
+  if (n === 0) return null;
 
-  const q1s = validRows.map(r => r.q1_val).filter(v => v !== null);
-  const q3s = validRows.map(r => r.q3_val).filter(v => v !== null);
-  const avgQ1 = q1s.length ? q1s.reduce((a, b) => a + b, 0) / q1s.length : null;
-  const avgQ3 = q3s.length ? q3s.reduce((a, b) => a + b, 0) / q3s.length : null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const min = sorted[0];
+  const max = sorted[n - 1];
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const variance = n > 1 ? values.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1) : 0;
+  const sd = Math.sqrt(variance);
+  const q1 = percentile(sorted, 0.25);
+  const median = percentile(sorted, 0.5);
+  const q3 = percentile(sorted, 0.75);
 
-  const sds = validRows.map(r => r.stddev_val).filter(v => v !== null && !Number.isNaN(v));
-  const avgSd = sds.length ? Math.sqrt(sds.reduce((a, b) => a + b * b, 0) / sds.length) : null;
+  const specViolations = (specLimit !== null && specLimit !== undefined)
+    ? values.filter(v => v > specLimit).length : 0;
 
-  const specViolations = validRows.reduce((s, r) => s + (r.n_spec_violation || 0), 0);
-  const specLimit = validRows.find(r => r.spec_limit !== null)?.spec_limit ?? null;
+  const totalExpected = expCount || points.length;
+  const missRate = totalExpected > 0 ? ((totalExpected - n) / totalExpected) * 100 : null;
 
   return {
-    min: allMins.length ? Math.min(...allMins) : null,
-    max: allMaxs.length ? Math.max(...allMaxs) : null,
-    mean: grandAvg, sd: avgSd, q1: avgQ1, q3: avgQ3,
-    iqr: (avgQ1 !== null && avgQ3 !== null) ? avgQ3 - avgQ1 : null,
-    missRate, totalPoints, totalExpected, specViolations, specLimit,
-    nHours: validRows.length, nHoursExpected: rows.length,
+    min, max, mean, sd, q1, q3,
+    iqr: (q1 !== null && q3 !== null) ? q3 - q1 : null,
+    missRate: missRate !== null ? Math.max(0, missRate) : null,
+    totalPoints: n,
+    totalExpected,
+    specViolations,
+    specLimit: specLimit ?? null,
+    ucl: mean + 3 * sd,
+    lcl: mean - 3 * sd,
   };
 }
 
@@ -201,24 +258,20 @@ function StatCard({ label, value, unit, highlight }) {
 // ============================================================
 // COMPONENT: Khối biểu đồ cho 1 (water_type, metric)
 // ============================================================
-function MetricBlock({ waterType, metric, rows, loading }) {
-  const stats = useMemo(() => aggregateStats(rows), [rows]);
+function MetricBlock({ waterType, metric, points, specLimit, expCount, loading }) {
+  const stats = useMemo(() => aggregateStatsRaw(points, metric.hasSpec ? specLimit : null, expCount), [points, specLimit, expCount]);
 
   const chartData = useMemo(() => {
-    if (!rows) return [];
-    return rows.map(r => ({
-      time: r.bucket_hour,
-      timeLabel: fmtDateShort(r.bucket_hour),
-      avg: r.avg_val,
-      min: r.min_val,
-      max: r.max_val,
-      ucl: r.ucl_val,
-      lcl: r.lcl_val,
-      specLimit: r.spec_limit,
-      violation: (r.spec_limit !== null && r.avg_val !== null && r.avg_val > r.spec_limit) ? r.avg_val : null,
-      missRate: r.miss_rate_pct,
+    if (!points || !stats) return [];
+    return points.filter(p => p.value !== null).map(p => ({
+      time: p.time,
+      timeLabel: p.timeLabel,
+      value: p.value,
+      ucl: stats.ucl,
+      lcl: stats.lcl,
+      violation: (metric.hasSpec && specLimit !== null && p.value > specLimit) ? p.value : null,
     }));
-  }, [rows]);
+  }, [points, stats, metric.hasSpec, specLimit]);
 
   const hasData = chartData.length > 0 && stats;
 
@@ -259,35 +312,33 @@ function MetricBlock({ waterType, metric, rows, loading }) {
       h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 } }, statCards),
 
       h('div', { style: { marginBottom: 18 } },
-        h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, 'Xu hướng theo thời gian (giá trị trung bình mỗi giờ)'),
-        h(ResponsiveContainer, { width: '100%', height: 180 },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, `Xu hướng theo thời gian (từng điểm đo thật, 1 phút/lần — ${stats.totalPoints.toLocaleString('vi-VN')} điểm)`),
+        h(ResponsiveContainer, { width: '100%', height: 220 },
           h(LineChart, { data: chartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
             h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
-            h(XAxis, { dataKey: 'timeLabel', tick: { fontSize: 10, fill: '#94a3b8' }, interval: 'preserveStartEnd', minTickGap: 40 }),
+            h(XAxis, { dataKey: 'timeLabel', tick: { fontSize: 10, fill: '#94a3b8' }, interval: 'preserveStartEnd', minTickGap: 60 }),
             h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 45, domain: ['auto', 'auto'] }),
             h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }, formatter: (v) => [fmtNum(v), metric.unit] }),
             (metric.hasSpec && stats.specLimit !== null) ? h(ReferenceLine, {
               y: stats.specLimit, stroke: '#dc2626', strokeDasharray: '4 4',
               label: { value: `Spec limit: ${stats.specLimit}`, position: 'insideTopRight', fontSize: 10, fill: '#dc2626' }
             }) : null,
-            h(Line, { type: 'monotone', dataKey: 'avg', stroke: waterType.accent, strokeWidth: 2, dot: false, name: 'Trung bình' }),
-            h(Line, { type: 'monotone', dataKey: 'max', stroke: '#cbd5e1', strokeWidth: 1, dot: false, name: 'Max', strokeDasharray: '2 2' }),
-            h(Line, { type: 'monotone', dataKey: 'min', stroke: '#cbd5e1', strokeWidth: 1, dot: false, name: 'Min', strokeDasharray: '2 2' })
+            h(Line, { type: 'monotone', dataKey: 'value', stroke: waterType.accent, strokeWidth: 1, dot: false, name: 'Giá trị', isAnimationActive: false })
           )
         )
       ),
 
       h('div', null,
-        h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, 'Biểu đồ kiểm soát (Control Chart — UCL/LCL = mean ± 3σ)'),
-        h(ResponsiveContainer, { width: '100%', height: 180 },
+        h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, 'Biểu đồ kiểm soát (Control Chart — UCL/LCL = mean ± 3σ, tính trên toàn bộ khoảng đã chọn)'),
+        h(ResponsiveContainer, { width: '100%', height: 220 },
           h(ComposedChart, { data: chartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
             h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
-            h(XAxis, { dataKey: 'timeLabel', tick: { fontSize: 10, fill: '#94a3b8' }, interval: 'preserveStartEnd', minTickGap: 40 }),
+            h(XAxis, { dataKey: 'timeLabel', tick: { fontSize: 10, fill: '#94a3b8' }, interval: 'preserveStartEnd', minTickGap: 60 }),
             h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 45, domain: ['auto', 'auto'] }),
             h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8, border: '1px solid #e2e8f0' }, formatter: (v, name) => [fmtNum(v), name] }),
-            h(Line, { type: 'monotone', dataKey: 'ucl', stroke: '#f59e0b', strokeWidth: 1.5, dot: false, name: 'UCL', strokeDasharray: '5 3' }),
-            h(Line, { type: 'monotone', dataKey: 'lcl', stroke: '#f59e0b', strokeWidth: 1.5, dot: false, name: 'LCL', strokeDasharray: '5 3' }),
-            h(Line, { type: 'monotone', dataKey: 'avg', stroke: waterType.accent, strokeWidth: 2, dot: { r: 2 }, name: 'Giá trị' }),
+            h(Line, { type: 'monotone', dataKey: 'ucl', stroke: '#f59e0b', strokeWidth: 1.5, dot: false, name: 'UCL', strokeDasharray: '5 3', isAnimationActive: false }),
+            h(Line, { type: 'monotone', dataKey: 'lcl', stroke: '#f59e0b', strokeWidth: 1.5, dot: false, name: 'LCL', strokeDasharray: '5 3', isAnimationActive: false }),
+            h(Line, { type: 'monotone', dataKey: 'value', stroke: waterType.accent, strokeWidth: 1, dot: false, name: 'Giá trị', isAnimationActive: false }),
             metric.hasSpec ? h(Scatter, { dataKey: 'violation', fill: '#dc2626', name: 'Vi phạm Spec', shape: 'diamond' }) : null
           )
         )
@@ -361,7 +412,7 @@ function FilterBar({ devices, selectedUuid, onSelectUuid, rangeKey, onRangeChang
 function TocDashboard() {
   const { devices, loading: devicesLoading, error: devicesError } = useDevices();
   const [selectedUuid, setSelectedUuid] = useState(null);
-  const [rangeKey, setRangeKey] = useState('7d');
+  const [rangeKey, setRangeKey] = useState('24h');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
 
@@ -373,13 +424,24 @@ function TocDashboard() {
     if (rangeKey === 'custom' && customFrom && customTo) {
       return { fromIso: new Date(customFrom).toISOString(), toIso: new Date(customTo).toISOString() };
     }
-    const preset = RANGE_PRESETS.find(p => p.key === rangeKey) || RANGE_PRESETS[1];
+    const preset = RANGE_PRESETS.find(p => p.key === rangeKey) || RANGE_PRESETS[0];
     const to = new Date();
     const from = new Date(to.getTime() - preset.hours * 3600 * 1000);
     return { fromIso: from.toISOString(), toIso: to.toISOString() };
   }, [rangeKey, customFrom, customTo]);
 
-  const { data, loading, error, refresh } = useStatsData(selectedUuid, fromIso, toIso);
+  const { rawRows, loading, error, refresh, loadedCount } = useRawData(selectedUuid, fromIso, toIso);
+  const expCount = useMemo(() => expectedCount(fromIso, toIso), [fromIso, toIso]);
+
+  const seriesByKey = useMemo(() => {
+    const result = {};
+    for (const wt of WATER_TYPES) {
+      for (const m of METRICS) {
+        result[`${wt.key}_${m.key}`] = extractSeries(rawRows, wt.key, m.key);
+      }
+    }
+    return result;
+  }, [rawRows]);
 
   const handleCustomChange = (which, val) => {
     if (which === 'from') setCustomFrom(val);
@@ -392,10 +454,17 @@ function TocDashboard() {
         style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 18, fontWeight: 800, color: wt.accent, borderBottom: `2px solid ${wt.accent}`, paddingBottom: 8, marginBottom: 16 }
       }, wt.label),
       METRICS.map(m => h(MetricBlock, {
-        key: `${wt.key}_${m.key}`, waterType: wt, metric: m, rows: data[`${wt.key}_${m.key}`], loading
+        key: `${wt.key}_${m.key}`, waterType: wt, metric: m,
+        points: seriesByKey[`${wt.key}_${m.key}`],
+        specLimit: TOC_SPEC_LIMIT, expCount, loading
       }))
     )
   ) : null;
+
+  const bigRangeWarning = (rangeKey === '7d' || rangeKey === '30d' || (rangeKey === 'custom' && expCount > 24 * 60 * 3))
+    ? h('div', { style: { background: '#fffbeb', color: '#b45309', padding: '10px 14px', borderRadius: 8, marginBottom: 16, fontSize: 12 } },
+        `⏳ Khoảng thời gian dài (~${expCount.toLocaleString('vi-VN')} điểm kỳ vọng/thông số) — biểu đồ vẽ từng điểm thật có thể tải chậm vài giây.`)
+    : null;
 
   return h('div', { style: { background: '#fff', minHeight: '100vh', padding: 20, color: '#0f172a' } },
     h(FilterBar, {
@@ -405,14 +474,16 @@ function TocDashboard() {
       onRefresh: refresh, loading
     }),
 
+    bigRangeWarning,
     devicesError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải danh sách thiết bị: ${devicesError}`) : null,
     error ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải dữ liệu: ${error}`) : null,
     devicesLoading ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Đang tải danh sách thiết bị...') : null,
     (!devicesLoading && devices.length === 0 && !devicesError) ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Chưa có thiết bị nào trong hệ thống. Hãy chạy workflow đồng bộ devices trước.') : null,
+    (!loading && loadedCount > 0) ? h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 12 } }, `Đã tải ${loadedCount.toLocaleString('vi-VN')} điểm đo thô từ ${fmtDateShort(fromIso)} đến ${fmtDateShort(toIso)}`) : null,
 
     waterSections,
 
-    h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
+    h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
   );
 }
 
