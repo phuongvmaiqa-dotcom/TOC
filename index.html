@@ -207,9 +207,13 @@ function percentile(sortedArr, p) {
 // ============================================================
 // Tính thống kê tổng hợp trực tiếp từ mảng điểm thô {time, value}
 // ============================================================
-function aggregateStatsRaw(points, specLimit, expCount) {
-  if (!points || !points.length) return null;
-  const values = points.map(p => p.value).filter(v => v !== null && !Number.isNaN(v));
+function aggregateStatsRaw(allPoints, specLimit, expCount) {
+  if (!allPoints || !allPoints.length) return null;
+
+  // totalRows = TỔNG SỐ DÒNG DỮ LIỆU THỰC TẾ đã ghi nhận trong khoảng thời gian (kể cả dòng có giá trị null)
+  const totalRows = allPoints.length;
+
+  const values = allPoints.map(p => p.value).filter(v => v !== null && !Number.isNaN(v));
   const n = values.length;
   if (n === 0) return null;
 
@@ -226,15 +230,17 @@ function aggregateStatsRaw(points, specLimit, expCount) {
   const specViolations = (specLimit !== null && specLimit !== undefined)
     ? values.filter(v => v > specLimit).length : 0;
 
-  const totalExpected = expCount || points.length;
-  const missRate = totalExpected > 0 ? ((totalExpected - n) / totalExpected) * 100 : null;
+  // % thiếu = số dòng có giá trị null/lỗi ở field này / TỔNG SỐ DÒNG ĐÃ GHI NHẬN (không phải số phút lý thuyết)
+  const missingRows = totalRows - n;
+  const missRate = totalRows > 0 ? (missingRows / totalRows) * 100 : null;
 
   return {
     min, max, mean, sd, q1, q3,
     iqr: (q1 !== null && q3 !== null) ? q3 - q1 : null,
     missRate: missRate !== null ? Math.max(0, missRate) : null,
     totalPoints: n,
-    totalExpected,
+    totalRows,
+    missingRows,
     specViolations,
     specLimit: specLimit ?? null,
     ucl: mean + 3 * sd,
@@ -301,7 +307,8 @@ function MetricBlock({ waterType, metric, points, specLimit, expCount, loading }
     h(StatCard, { key: 'q3', label: 'Q3', value: fmtNum(stats?.q3), unit: metric.unit }),
     h(StatCard, { key: 'iqr', label: 'IQR', value: fmtNum(stats?.iqr), unit: metric.unit }),
     h(StatCard, {
-      key: 'miss', label: '% Thiếu dữ liệu', value: fmtNum(stats?.missRate, 1), unit: '%',
+      key: 'miss', label: '% Thiếu dữ liệu', value: fmtNum(stats?.missRate, 1),
+      unit: stats ? `% (${stats.missingRows}/${stats.totalRows} dòng)` : '%',
       highlight: stats && stats.missRate > 10 ? '#dc2626' : (stats && stats.missRate > 2 ? '#d97706' : '#16a34a')
     }),
   ];
