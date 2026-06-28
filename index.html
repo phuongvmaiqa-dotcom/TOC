@@ -30,6 +30,9 @@ const { useState, useEffect, useMemo, useCallback, useRef, Fragment } = React;
 const SUPABASE_URL = 'https://fegayqatcpmvbuuzzjzw.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_BrE8lu-Qjj4uA-auK4T5jw_7Q_uNUOF';
 
+// SỬA dòng dưới thành domain n8n thật của bạn + đúng path webhook
+const N8N_REPORT_WEBHOOK_URL = 'https://n8n.cpc1hn.com/webhook/toc-report-webhook';
+
 const REST_BASE = `${SUPABASE_URL}/rest/v1`;
 const HEADERS = {
   apikey: SUPABASE_ANON_KEY,
@@ -380,59 +383,81 @@ function MetricBlock({ waterType, metric, points, specLimit, expCount, loading }
 // ============================================================
 // COMPONENT: Header với bộ lọc thời gian
 // ============================================================
-function FilterBar({ devices, selectedUuid, onSelectUuid, rangeKey, onRangeChange, customFrom, customTo, onCustomChange, onRefresh, loading }) {
+function FilterBar({ devices, selectedUuid, onSelectUuid, rangeKey, onRangeChange, customFrom, customTo, onCustomChange, onRefresh, loading, onSendReport, reportStatus }) {
   const isCustom = rangeKey === 'custom';
 
-  return h('div', {
-    style: { background: '#0f172a', borderRadius: 12, padding: '16px 20px', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14, marginBottom: 24 }
-  },
-    h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, color: '#fff', fontWeight: 700, fontSize: 15, marginRight: 8 } }, '📊 TOC Monitoring'),
+  return h('div', { style: { marginBottom: 24 } },
+    h('div', {
+      style: { background: '#0f172a', borderRadius: 12, padding: '16px 20px', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14 }
+    },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, color: '#fff', fontWeight: 700, fontSize: 15, marginRight: 8 } }, '📊 TOC Monitoring'),
 
-    h('select', {
-      value: selectedUuid || '',
-      onChange: (e) => onSelectUuid(e.target.value),
-      style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
-    }, devices.map(d => h('option', { key: d.uuid, value: d.uuid }, `${d.location_name || d.model || d.uuid} (${d.uuid})`))),
+      h('select', {
+        value: selectedUuid || '',
+        onChange: (e) => onSelectUuid(e.target.value),
+        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, devices.map(d => h('option', { key: d.uuid, value: d.uuid }, `${d.location_name || d.model || d.uuid} (${d.uuid})`))),
 
-    h('div', { style: { display: 'flex', gap: 4 } },
-      RANGE_PRESETS.map(p => h('button', {
-        key: p.key,
-        onClick: () => onRangeChange(p.key),
-        style: {
-          background: rangeKey === p.key ? '#38bdf8' : '#1e293b',
-          color: rangeKey === p.key ? '#0f172a' : '#94a3b8',
-          border: 'none', borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer'
-        }
-      }, p.label)),
+      h('div', { style: { display: 'flex', gap: 4 } },
+        RANGE_PRESETS.map(p => h('button', {
+          key: p.key,
+          onClick: () => onRangeChange(p.key),
+          style: {
+            background: rangeKey === p.key ? '#38bdf8' : '#1e293b',
+            color: rangeKey === p.key ? '#0f172a' : '#94a3b8',
+            border: 'none', borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer'
+          }
+        }, p.label)),
+        h('button', {
+          onClick: () => onRangeChange('custom'),
+          style: {
+            background: isCustom ? '#38bdf8' : '#1e293b', color: isCustom ? '#0f172a' : '#94a3b8',
+            border: 'none', borderRadius: 6, padding: '6px 10px', fontSize: 12, fontWeight: 600, cursor: 'pointer'
+          }
+        }, '📅 Tùy chọn')
+      ),
+
+      isCustom ? h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
+        h('input', {
+          type: 'datetime-local', value: customFrom, onChange: (e) => onCustomChange('from', e.target.value),
+          style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }
+        }),
+        h('span', { style: { color: '#64748b', fontSize: 12 } }, '→'),
+        h('input', {
+          type: 'datetime-local', value: customTo, onChange: (e) => onCustomChange('to', e.target.value),
+          style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }
+        })
+      ) : null,
+
       h('button', {
-        onClick: () => onRangeChange('custom'),
+        onClick: onRefresh,
         style: {
-          background: isCustom ? '#38bdf8' : '#1e293b', color: isCustom ? '#0f172a' : '#94a3b8',
-          border: 'none', borderRadius: 6, padding: '6px 10px', fontSize: 12, fontWeight: 600, cursor: 'pointer'
+          marginLeft: 'auto', background: '#1e293b', color: '#38bdf8', border: '1px solid #334155',
+          borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer'
+        },
+        className: loading ? 'spin' : ''
+      }, loading ? '⏳ Đang tải...' : '🔄 Tải lại'),
+
+      h('button', {
+        onClick: onSendReport,
+        disabled: reportStatus.sending,
+        style: {
+          background: '#16a34a', color: '#fff', border: 'none',
+          borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 700,
+          cursor: reportStatus.sending ? 'not-allowed' : 'pointer',
+          opacity: reportStatus.sending ? 0.6 : 1
         }
-      }, '📅 Tùy chọn')
+      }, reportStatus.sending ? '⏳ Đang gửi...' : '📧 Gửi báo cáo')
     ),
 
-    isCustom ? h('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
-      h('input', {
-        type: 'datetime-local', value: customFrom, onChange: (e) => onCustomChange('from', e.target.value),
-        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }
-      }),
-      h('span', { style: { color: '#64748b', fontSize: 12 } }, '→'),
-      h('input', {
-        type: 'datetime-local', value: customTo, onChange: (e) => onCustomChange('to', e.target.value),
-        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }
-      })
-    ) : null,
-
-    h('button', {
-      onClick: onRefresh,
+    reportStatus.message ? h('div', {
       style: {
-        marginLeft: 'auto', background: '#1e293b', color: '#38bdf8', border: '1px solid #334155',
-        borderRadius: 6, padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer'
-      },
-      className: loading ? 'spin' : ''
-    }, loading ? '⏳ Đang tải...' : '🔄 Tải lại')
+        marginTop: 10, padding: '10px 14px', borderRadius: 8, fontSize: 13,
+        background: reportStatus.success ? '#f0fdf4' : '#fef2f2',
+        color: reportStatus.success ? '#16a34a' : '#dc2626',
+        border: `1px solid ${reportStatus.success ? '#bbf7d0' : '#fecaca'}`
+      }
+    }, reportStatus.message) : null
   );
 }
 
@@ -462,6 +487,33 @@ function TocDashboard() {
 
   const { rawRows, loading, error, refresh, loadedCount } = useRawData(selectedUuid, fromIso, toIso);
   const expCount = useMemo(() => expectedCount(fromIso, toIso), [fromIso, toIso]);
+
+  const [reportStatus, setReportStatus] = useState({ sending: false, success: null, message: '' });
+
+  const handleSendReport = useCallback(async () => {
+    setReportStatus({ sending: true, success: null, message: '' });
+    try {
+      const res = await fetch(N8N_REPORT_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fromDate: fromIso, toDate: toIso, uuid: selectedUuid })
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+      }
+      const data = await res.json();
+      setReportStatus({
+        sending: false, success: true,
+        message: `✅ ${data.message || 'Đã gửi báo cáo thành công.'}`
+      });
+    } catch (err) {
+      setReportStatus({
+        sending: false, success: false,
+        message: `❌ Gửi báo cáo thất bại: ${err.message || String(err)}`
+      });
+    }
+  }, [fromIso, toIso, selectedUuid]);
 
   const seriesByKey = useMemo(() => {
     const result = {};
@@ -501,7 +553,8 @@ function TocDashboard() {
       devices, selectedUuid, onSelectUuid: setSelectedUuid,
       rangeKey, onRangeChange: setRangeKey,
       customFrom, customTo, onCustomChange: handleCustomChange,
-      onRefresh: refresh, loading
+      onRefresh: refresh, loading,
+      onSendReport: handleSendReport, reportStatus
     }),
 
     bigRangeWarning,
