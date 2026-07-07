@@ -20,6 +20,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   ReferenceLine, Scatter, ComposedChart
 } from 'https://esm.sh/recharts@2.10.3?deps=react@18.2.0,react-dom@18.2.0';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
 const h = React.createElement;
 const { useState, useEffect, useMemo, useCallback, useRef, Fragment } = React;
@@ -34,10 +35,21 @@ const SUPABASE_ANON_KEY = 'sb_publishable_BrE8lu-Qjj4uA-auK4T5jw_7Q_uNUOF';
 const N8N_REPORT_WEBHOOK_URL = 'https://n8n.cpc1hn.com/webhook/toc-report-webhook';
 
 const REST_BASE = `${SUPABASE_URL}/rest/v1`;
-const HEADERS = {
-  apikey: SUPABASE_ANON_KEY,
-  Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-};
+
+// Client dùng riêng cho Auth (login/logout/đổi mật khẩu/quên mật khẩu)
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+});
+
+// Headers cho các request REST tới PostgREST.
+// Khi có accessToken (đã đăng nhập) -> gửi kèm để RLS nhận diện role "authenticated".
+// Nếu không có -> fallback về anon key (sẽ bị RLS chặn nếu bạn đã bật policy yêu cầu đăng nhập).
+function buildHeaders(accessToken) {
+  return {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${accessToken || SUPABASE_ANON_KEY}`,
+  };
+}
 
 // ============================================================
 // CẤU HÌNH HIỂN THỊ
@@ -73,19 +85,50 @@ function fmtDateShort(iso) {
 }
 
 // ============================================================
+// HOOK: quản lý phiên đăng nhập Supabase Auth
+// ============================================================
+function useSupabaseSession() {
+  const [session, setSession] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (cancelled) return;
+      setSession(data.session);
+      setLoading(false);
+    });
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession);
+      setLoading(false);
+    });
+
+    return () => {
+      cancelled = true;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  return { session, loading };
+}
+
+// ============================================================
 // HOOK: lấy dữ liệu THÔ (1 điểm đo/phút) theo khoảng thời gian
 // Tự phân trang để vượt giới hạn mặc định 1000 dòng/request của PostgREST
 // ============================================================
-async function fetchAllRows(uuid, fromIso, toIso) {
+async function fetchAllRows(uuid, fromIso, toIso, accessToken) {
   const PAGE_SIZE = 1000;
   let allRows = [];
   let offset = 0;
+  const headers = buildHeaders(accessToken);
   while (true) {
     const url = `${REST_BASE}/toc_data_raw?uuid=eq.${encodeURIComponent(uuid)}` +
       `&device_timestamp=gte.${encodeURIComponent(fromIso)}` +
       `&device_timestamp=lte.${encodeURIComponent(toIso)}` +
       `&order=device_timestamp.asc&limit=${PAGE_SIZE}&offset=${offset}`;
-    const res = await fetch(url, { headers: HEADERS });
+    const res = await fetch(url, { headers });
     if (!res.ok) {
       const txt = await res.text();
       throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
@@ -99,7 +142,7 @@ async function fetchAllRows(uuid, fromIso, toIso) {
   return allRows;
 }
 
-function useRawData(uuid, fromIso, toIso) {
+function useRawData(uuid, fromIso, toIso, accessToken) {
   const [rawRows, setRawRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -109,13 +152,13 @@ function useRawData(uuid, fromIso, toIso) {
   const refresh = useCallback(() => setRefreshKey(k => k + 1), []);
 
   useEffect(() => {
-    if (!uuid) return;
+    if (!uuid || !accessToken) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
     setLoadedCount(0);
 
-    fetchAllRows(uuid, fromIso, toIso)
+    fetchAllRows(uuid, fromIso, toIso, accessToken)
       .then((rows) => {
         if (cancelled) return;
         setRawRows(rows);
@@ -129,7 +172,7 @@ function useRawData(uuid, fromIso, toIso) {
       });
 
     return () => { cancelled = true; };
-  }, [uuid, fromIso, toIso, refreshKey]);
+  }, [uuid, fromIso, toIso, accessToken, refreshKey]);
 
   return { rawRows, loading, error, refresh, loadedCount };
 }
@@ -153,13 +196,15 @@ function expectedCount(fromIso, toIso) {
 // ============================================================
 // HOOK: lấy danh sách devices
 // ============================================================
-function useDevices() {
+function useDevices(accessToken) {
   const [devices, setDevices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    fetch(`${REST_BASE}/toc_devices?select=*&order=location_name.asc`, { headers: HEADERS })
+    if (!accessToken) return;
+    setLoading(true);
+    fetch(`${REST_BASE}/toc_devices?select=*&order=location_name.asc`, { headers: buildHeaders(accessToken) })
       .then(async (res) => {
         if (!res.ok) {
           const txt = await res.text();
@@ -169,7 +214,7 @@ function useDevices() {
       })
       .then((rows) => { setDevices(rows); setLoading(false); })
       .catch((err) => { setError(err.message || String(err)); setLoading(false); });
-  }, []);
+  }, [accessToken]);
 
   return { devices, loading, error };
 }
@@ -177,7 +222,7 @@ function useDevices() {
 // ============================================================
 // Trích danh sách điểm {time, value} cho 1 (water_type, metric) từ rawRows
 // ============================================================
-function extractSeries(rawRows, waterType, metricKey, specLimit) {
+function extractSeries(rawRows, waterType, metricKey) {
   const field = RAW_FIELD_MAP[`${waterType}_${metricKey}`];
   const points = [];
   for (const r of rawRows) {
@@ -207,12 +252,10 @@ function percentile(sortedArr, p) {
 // ============================================================
 // Tính thống kê tổng hợp trực tiếp từ mảng điểm thô {time, value}
 // ============================================================
-function aggregateStatsRaw(allPoints, specLimit, expCount) {
+function aggregateStatsRaw(allPoints, specLimit) {
   if (!allPoints || !allPoints.length) return null;
 
-  // totalRows = TỔNG SỐ DÒNG DỮ LIỆU THỰC TẾ đã ghi nhận trong khoảng thời gian (kể cả dòng có giá trị null)
   const totalRows = allPoints.length;
-
   const values = allPoints.map(p => p.value).filter(v => v !== null && !Number.isNaN(v));
   const n = values.length;
   if (n === 0) return null;
@@ -224,13 +267,11 @@ function aggregateStatsRaw(allPoints, specLimit, expCount) {
   const variance = n > 1 ? values.reduce((s, v) => s + (v - mean) ** 2, 0) / (n - 1) : 0;
   const sd = Math.sqrt(variance);
   const q1 = percentile(sorted, 0.25);
-  const median = percentile(sorted, 0.5);
   const q3 = percentile(sorted, 0.75);
 
   const specViolations = (specLimit !== null && specLimit !== undefined)
     ? values.filter(v => v > specLimit).length : 0;
 
-  // % thiếu = số dòng có giá trị null/lỗi ở field này / TỔNG SỐ DÒNG ĐÃ GHI NHẬN (không phải số phút lý thuyết)
   const missingRows = totalRows - n;
   const missRate = totalRows > 0 ? (missingRows / totalRows) * 100 : null;
 
@@ -268,8 +309,8 @@ function StatCard({ label, value, unit, highlight }) {
 // ============================================================
 // COMPONENT: Khối biểu đồ cho 1 (water_type, metric)
 // ============================================================
-function MetricBlock({ waterType, metric, points, specLimit, expCount, loading }) {
-  const stats = useMemo(() => aggregateStatsRaw(points, metric.hasSpec ? specLimit : null, expCount), [points, specLimit, expCount]);
+function MetricBlock({ waterType, metric, points, specLimit, loading }) {
+  const stats = useMemo(() => aggregateStatsRaw(points, metric.hasSpec ? specLimit : null), [points, specLimit]);
 
   const chartData = useMemo(() => {
     if (!points || !stats) return [];
@@ -284,13 +325,11 @@ function MetricBlock({ waterType, metric, points, specLimit, expCount, loading }
     }));
   }, [points, stats, metric.hasSpec, specLimit]);
 
-  // Khoảng thời gian thật của dữ liệu, dùng cho domain trục X
   const timeDomain = useMemo(() => {
     if (!chartData.length) return [0, 1];
     return [chartData[0].timeMs, chartData[chartData.length - 1].timeMs];
   }, [chartData]);
 
-  // Format nhãn trục X theo phút (HH:mm), không hiện giây — vì dữ liệu gốc là 1 điểm/phút
   const tickFormatterTime = (ms) => {
     const d = new Date(ms);
     return d.toLocaleString('vi-VN', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -393,7 +432,7 @@ function MetricBlock({ waterType, metric, points, specLimit, expCount, loading }
 function FilterBar({ devices, selectedUuid, onSelectUuid, rangeKey, onRangeChange, customFrom, customTo, onCustomChange, onRefresh, loading, onSendReport, reportStatus }) {
   const isCustom = rangeKey === 'custom';
 
-  return h('div', { style: { marginBottom: 24 } },
+  return h('div', { style: { marginBottom: 0 } },
     h('div', {
       style: { background: '#0f172a', borderRadius: 12, padding: '16px 20px', display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 14 }
     },
@@ -469,14 +508,195 @@ function FilterBar({ devices, selectedUuid, onSelectUuid, rangeKey, onRangeChang
 }
 
 // ============================================================
-// APP CHÍNH
+// COMPONENT: thanh tài khoản (email + đổi mật khẩu + đăng xuất)
 // ============================================================
-function TocDashboard() {
-  const { devices, loading: devicesLoading, error: devicesError } = useDevices();
+function AccountBar({ email, onLogout, onOpenChangePassword, loggingOut }) {
+  return h('div', {
+    style: {
+      display: 'flex', alignItems: 'center', gap: 12, justifyContent: 'flex-end',
+      padding: '8px 4px', marginBottom: 16, fontSize: 12.5, color: '#64748b'
+    }
+  },
+    h('span', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+      h('span', { style: { width: 6, height: 6, borderRadius: '50%', background: '#16a34a', display: 'inline-block' } }),
+      h('span', null, email)
+    ),
+    h('button', {
+      onClick: onOpenChangePassword,
+      style: { background: 'none', border: 'none', color: '#2563eb', fontSize: 12.5, cursor: 'pointer', fontWeight: 600, padding: 0 }
+    }, 'Đổi mật khẩu'),
+    h('button', {
+      onClick: onLogout,
+      disabled: loggingOut,
+      style: { background: 'none', border: 'none', color: '#dc2626', fontSize: 12.5, cursor: 'pointer', fontWeight: 600, padding: 0 }
+    }, loggingOut ? 'Đang đăng xuất...' : 'Đăng xuất')
+  );
+}
+
+// ============================================================
+// COMPONENT: modal đổi mật khẩu
+// ============================================================
+function ChangePasswordModal({ onClose }) {
+  const [pw1, setPw1] = useState('');
+  const [pw2, setPw2] = useState('');
+  const [error, setError] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    if (pw1.length < 6) { setError('Mật khẩu phải có ít nhất 6 ký tự.'); return; }
+    if (pw1 !== pw2) { setError('Mật khẩu nhập lại không khớp.'); return; }
+    setSaving(true);
+    const { error: err } = await supabase.auth.updateUser({ password: pw1 });
+    setSaving(false);
+    if (err) { setError(err.message); return; }
+    setDone(true);
+  };
+
+  const inputStyle = { width: '100%', boxSizing: 'border-box', border: '1px solid #cbd5e1', borderRadius: 8, padding: '9px 11px', fontSize: 13.5, marginTop: 4 };
+  const labelStyle = { fontSize: 12.5, fontWeight: 600, color: '#334155' };
+
+  return h('div', {
+    style: {
+      position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.55)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16
+    },
+    onClick: onClose
+  },
+    h('div', {
+      style: { background: '#fff', borderRadius: 14, padding: '24px 24px', width: '100%', maxWidth: 340, boxShadow: '0 20px 60px rgba(0,0,0,0.35)' },
+      onClick: (e) => e.stopPropagation()
+    },
+      h('div', { style: { fontWeight: 800, fontSize: 15, color: '#0f172a', marginBottom: 16 } }, '🔒 Đổi mật khẩu'),
+
+      done
+        ? h(Fragment, null,
+            h('div', { style: { background: '#f0fdf4', color: '#16a34a', fontSize: 13, padding: '10px 12px', borderRadius: 8, marginBottom: 16 } }, '✅ Đổi mật khẩu thành công.'),
+            h('button', {
+              onClick: onClose,
+              style: { width: '100%', background: '#0f172a', color: '#fff', border: 'none', borderRadius: 8, padding: '10px', fontWeight: 700, fontSize: 13.5, cursor: 'pointer' }
+            }, 'Đóng')
+          )
+        : h('form', { onSubmit: submit },
+            h('label', { style: labelStyle }, 'Mật khẩu mới'),
+            h('input', { type: 'password', value: pw1, onChange: e => setPw1(e.target.value), style: inputStyle, placeholder: 'Tối thiểu 6 ký tự', autoFocus: true }),
+            h('label', { style: { ...labelStyle, marginTop: 12, display: 'block' } }, 'Nhập lại mật khẩu mới'),
+            h('input', { type: 'password', value: pw2, onChange: e => setPw2(e.target.value), style: inputStyle }),
+            error ? h('div', { style: { color: '#dc2626', fontSize: 12.5, marginTop: 10, background: '#fef2f2', padding: '8px 10px', borderRadius: 6 } }, error) : null,
+            h('div', { style: { display: 'flex', gap: 8, marginTop: 18 } },
+              h('button', {
+                type: 'button', onClick: onClose,
+                style: { flex: 1, background: '#f1f5f9', color: '#475569', border: 'none', borderRadius: 8, padding: '10px', fontWeight: 600, fontSize: 13.5, cursor: 'pointer' }
+              }, 'Hủy'),
+              h('button', {
+                type: 'submit', disabled: saving,
+                style: { flex: 1, background: '#0f172a', color: '#fff', border: 'none', borderRadius: 8, padding: '10px', fontWeight: 700, fontSize: 13.5, cursor: saving ? 'not-allowed' : 'pointer', opacity: saving ? 0.7 : 1 }
+              }, saving ? 'Đang lưu...' : 'Lưu mật khẩu')
+            )
+          )
+    )
+  );
+}
+
+// ============================================================
+// COMPONENT: màn hình đăng nhập
+// ============================================================
+function LoginScreen() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+
+  const inputStyle = { width: '100%', boxSizing: 'border-box', border: '1px solid #cbd5e1', borderRadius: 8, padding: '10px 12px', fontSize: 14, marginTop: 4 };
+  const labelStyle = { fontSize: 12.5, fontWeight: 600, color: '#334155' };
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setResetSent(false);
+    setLoading(true);
+    const { error: err } = await supabase.auth.signInWithPassword({ email, password });
+    setLoading(false);
+    if (err) {
+      setError(err.message === 'Invalid login credentials' ? 'Sai email hoặc mật khẩu.' : err.message);
+    }
+    // Đăng nhập thành công -> onAuthStateChange ở component gốc sẽ tự chuyển màn hình
+  };
+
+  const handleReset = async () => {
+    if (!email) { setError('Nhập email của bạn trước khi bấm "Quên mật khẩu?".'); return; }
+    setError('');
+    setLoading(true);
+    const { error: err } = await supabase.auth.resetPasswordForEmail(email);
+    setLoading(false);
+    if (err) { setError(err.message); return; }
+    setResetSent(true);
+  };
+
+  return h('div', {
+    style: { minHeight: '100vh', background: '#0f172a', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }
+  },
+    h('form', {
+      onSubmit: submit,
+      style: { background: '#fff', borderRadius: 14, padding: '32px 28px', width: '100%', maxWidth: 360, boxShadow: '0 20px 60px rgba(0,0,0,0.35)' }
+    },
+      h('div', { style: { textAlign: 'center', marginBottom: 22 } },
+        h('div', { style: { fontSize: 28, marginBottom: 6 } }, '📊'),
+        h('div', { style: { fontWeight: 800, fontSize: 17, color: '#0f172a' } }, 'TOC Monitoring Dashboard'),
+        h('div', { style: { fontSize: 12, color: '#94a3b8', marginTop: 4 } }, 'Đăng nhập để tiếp tục')
+      ),
+
+      h('label', { style: labelStyle }, 'Email'),
+      h('input', {
+        type: 'email', required: true, value: email, onChange: e => setEmail(e.target.value),
+        style: inputStyle, placeholder: 'ban@congty.com', autoFocus: true
+      }),
+
+      h('label', { style: { ...labelStyle, marginTop: 12, display: 'block' } }, 'Mật khẩu'),
+      h('input', {
+        type: 'password', required: true, value: password, onChange: e => setPassword(e.target.value),
+        style: inputStyle, placeholder: '••••••••'
+      }),
+
+      error ? h('div', { style: { color: '#dc2626', fontSize: 12.5, marginTop: 10, background: '#fef2f2', padding: '8px 10px', borderRadius: 6 } }, error) : null,
+      resetSent ? h('div', { style: { color: '#16a34a', fontSize: 12.5, marginTop: 10, background: '#f0fdf4', padding: '8px 10px', borderRadius: 6 } }, '✅ Nếu email tồn tại trong hệ thống, một email đặt lại mật khẩu đã được gửi.') : null,
+
+      h('button', {
+        type: 'submit', disabled: loading,
+        style: {
+          marginTop: 16, width: '100%', background: '#0f172a', color: '#fff', border: 'none',
+          borderRadius: 8, padding: '11px', fontWeight: 700, fontSize: 14,
+          cursor: loading ? 'not-allowed' : 'pointer', opacity: loading ? 0.7 : 1
+        }
+      }, loading ? 'Đang đăng nhập...' : 'Đăng nhập'),
+
+      h('button', {
+        type: 'button', onClick: handleReset, disabled: loading,
+        style: { marginTop: 10, width: '100%', background: 'none', border: 'none', color: '#2563eb', fontSize: 12.5, cursor: 'pointer', padding: 6 }
+      }, 'Quên mật khẩu?'),
+
+      h('div', { style: { textAlign: 'center', fontSize: 11, color: '#94a3b8', marginTop: 14 } }, 'Tài khoản do quản trị viên hệ thống cấp. Liên hệ quản trị viên nếu bạn chưa có tài khoản.')
+    )
+  );
+}
+
+// ============================================================
+// APP CHÍNH (sau khi đã đăng nhập)
+// ============================================================
+function TocDashboard({ session, onLogout }) {
+  const accessToken = session.access_token;
+  const userEmail = session.user?.email || '';
+
+  const { devices, loading: devicesLoading, error: devicesError } = useDevices(accessToken);
   const [selectedUuid, setSelectedUuid] = useState(null);
   const [rangeKey, setRangeKey] = useState('24h');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
+  const [showChangePw, setShowChangePw] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   useEffect(() => {
     if (devices.length && !selectedUuid) setSelectedUuid(devices[0].uuid);
@@ -492,7 +712,7 @@ function TocDashboard() {
     return { fromIso: from.toISOString(), toIso: to.toISOString() };
   }, [rangeKey, customFrom, customTo]);
 
-  const { rawRows, loading, error, refresh, loadedCount } = useRawData(selectedUuid, fromIso, toIso);
+  const { rawRows, loading, error, refresh, loadedCount } = useRawData(selectedUuid, fromIso, toIso, accessToken);
   const expCount = useMemo(() => expectedCount(fromIso, toIso), [fromIso, toIso]);
 
   const [reportStatus, setReportStatus] = useState({ sending: false, success: null, message: '' });
@@ -522,6 +742,12 @@ function TocDashboard() {
     }
   }, [fromIso, toIso, selectedUuid]);
 
+  const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
+    await supabase.auth.signOut();
+    // onAuthStateChange ở component gốc sẽ tự chuyển về màn hình đăng nhập
+  }, []);
+
   const seriesByKey = useMemo(() => {
     const result = {};
     for (const wt of WATER_TYPES) {
@@ -545,7 +771,7 @@ function TocDashboard() {
       METRICS.map(m => h(MetricBlock, {
         key: `${wt.key}_${m.key}`, waterType: wt, metric: m,
         points: seriesByKey[`${wt.key}_${m.key}`],
-        specLimit: TOC_SPEC_LIMIT, expCount, loading
+        specLimit: TOC_SPEC_LIMIT, loading
       }))
     )
   ) : null;
@@ -556,6 +782,11 @@ function TocDashboard() {
     : null;
 
   return h('div', { style: { background: '#fff', minHeight: '100vh', padding: 20, color: '#0f172a' } },
+    h(AccountBar, {
+      email: userEmail, onLogout: handleLogout, loggingOut,
+      onOpenChangePassword: () => setShowChangePw(true)
+    }),
+
     h(FilterBar, {
       devices, selectedUuid, onSelectUuid: setSelectedUuid,
       rangeKey, onRangeChange: setRangeKey,
@@ -564,21 +795,44 @@ function TocDashboard() {
       onSendReport: handleSendReport, reportStatus
     }),
 
-    bigRangeWarning,
-    devicesError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải danh sách thiết bị: ${devicesError}`) : null,
-    error ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải dữ liệu: ${error}`) : null,
-    devicesLoading ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Đang tải danh sách thiết bị...') : null,
-    (!devicesLoading && devices.length === 0 && !devicesError) ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Chưa có thiết bị nào trong hệ thống. Hãy chạy workflow đồng bộ devices trước.') : null,
-    (!loading && loadedCount > 0) ? h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 12 } }, `Đã tải ${loadedCount.toLocaleString('vi-VN')} điểm đo thô từ ${fmtDateShort(fromIso)} đến ${fmtDateShort(toIso)}`) : null,
+    h('div', { style: { marginTop: 20 } },
+      bigRangeWarning,
+      devicesError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải danh sách thiết bị: ${devicesError}`) : null,
+      error ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải dữ liệu: ${error}`) : null,
+      devicesLoading ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Đang tải danh sách thiết bị...') : null,
+      (!devicesLoading && devices.length === 0 && !devicesError) ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Chưa có thiết bị nào trong hệ thống. Hãy chạy workflow đồng bộ devices trước.') : null,
+      (!loading && loadedCount > 0) ? h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 12 } }, `Đã tải ${loadedCount.toLocaleString('vi-VN')} điểm đo thô từ ${fmtDateShort(fromIso)} đến ${fmtDateShort(toIso)}`) : null,
 
-    waterSections,
+      waterSections,
 
-    h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
+      h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
+    ),
+
+    showChangePw ? h(ChangePasswordModal, { onClose: () => setShowChangePw(false) }) : null
   );
 }
 
+// ============================================================
+// ROOT: kiểm tra phiên đăng nhập trước khi hiện dashboard
+// ============================================================
+function Root() {
+  const { session, loading } = useSupabaseSession();
+
+  if (loading) {
+    return h('div', {
+      style: { minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#94a3b8', fontSize: 13 }
+    }, 'Đang kiểm tra đăng nhập...');
+  }
+
+  if (!session) {
+    return h(LoginScreen);
+  }
+
+  return h(TocDashboard, { session });
+}
+
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(h(TocDashboard));
+root.render(h(Root));
 </script>
 </body>
 </html>
