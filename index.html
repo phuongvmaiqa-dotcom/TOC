@@ -301,32 +301,90 @@ function useSupabaseSession() {
 }
 
 // ============================================================
-// HOOK: lấy dữ liệu THÔ (1 điểm đo/phút) theo khoảng thời gian
-// Tự phân trang để vượt giới hạn mặc định 1000 dòng/request của PostgREST
+// TIỆN ÍCH TỐI ƯU TỐC ĐỘ TẢI DỮ LIỆU
 // ============================================================
-async function fetchAllRows(uuid, fromIso, toIso, accessToken) {
-  const PAGE_SIZE = 1000;
-  let allRows = [];
-  let offset = 0;
-  const headers = buildHeaders(accessToken);
-  while (true) {
-    const url = `${REST_BASE}/toc_data_raw?uuid=eq.${encodeURIComponent(uuid)}` +
-      `&device_timestamp=gte.${encodeURIComponent(fromIso)}` +
-      `&device_timestamp=lte.${encodeURIComponent(toIso)}` +
-      `&order=device_timestamp.asc&limit=${PAGE_SIZE}&offset=${offset}`;
-    const res = await fetch(url, { headers });
+// Chạy tối đa `limit` tác vụ (thunk trả về Promise) song song cùng lúc,
+// thay vì chờ tuần tự từng cái — giúp tận dụng băng thông & giảm tổng
+// thời gian chờ do độ trễ round-trip của từng request.
+async function runWithConcurrency(tasks, limit) {
+  const results = new Array(tasks.length);
+  let next = 0;
+  async function worker() {
+    while (next < tasks.length) {
+      const cur = next++;
+      results[cur] = await tasks[cur]();
+    }
+  }
+  const workerCount = Math.max(1, Math.min(limit, tasks.length));
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return results;
+}
+
+// Phân trang PostgREST (mặc định tối đa 1000 dòng/request) theo kiểu SONG SONG:
+// - Dựa vào `expectedRows` (ước lượng số dòng, KHÔNG cần query COUNT(*) tốn kém trên bảng lớn)
+//   để bắn trước hàng loạt trang cùng lúc (giới hạn `concurrency` trang/lần).
+// - Nếu trang cuối cùng trong đợt bắn song song vẫn đầy (nghĩa là còn dữ liệu ngoài dự kiến,
+//   ví dụ tần suất ghi dày hơn bình thường), tự động lấy tiếp tuần tự cho tới khi hết dữ liệu.
+async function fetchPagedParallel(buildUrl, headers, expectedRows, options = {}) {
+  const PAGE_SIZE = options.pageSize || 1000;
+  const CONCURRENCY = options.concurrency || 6;
+  const MAX_PAGES = options.maxPages || 500; // an toàn, tránh lặp vô hạn nếu có lỗi
+
+  const fetchPage = async (offset) => {
+    const res = await fetch(buildUrl(offset, PAGE_SIZE), { headers });
     if (!res.ok) {
       const txt = await res.text();
       throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
     }
-    const rows = await res.json();
+    return res.json();
+  };
+
+  const initialPages = Math.min(
+    MAX_PAGES,
+    Math.max(1, Math.ceil((expectedRows || PAGE_SIZE) / PAGE_SIZE)) + 1 // +1 trang dự phòng
+  );
+  const tasks = Array.from({ length: initialPages }, (_, i) => () => fetchPage(i * PAGE_SIZE));
+  const pages = await runWithConcurrency(tasks, CONCURRENCY);
+
+  let allRows = pages.flat();
+
+  // Dự phòng tuần tự nếu trang cuối cùng (offset lớn nhất) vẫn đầy 1000 dòng
+  let lastLen = pages.length ? pages[pages.length - 1].length : 0;
+  let nextOffset = initialPages * PAGE_SIZE;
+  let safety = 0;
+  while (lastLen === PAGE_SIZE && safety < MAX_PAGES) {
+    const rows = await fetchPage(nextOffset);
     allRows = allRows.concat(rows);
-    if (rows.length < PAGE_SIZE) break; // hết dữ liệu
-    offset += PAGE_SIZE;
-    if (offset > 200000) break; // an toàn, tránh lặp vô hạn nếu có lỗi
+    lastLen = rows.length;
+    nextOffset += PAGE_SIZE;
+    safety += 1;
   }
+
   return allRows;
 }
+
+// Các cột thực sự dùng tới trong bảng toc_data_raw (bỏ bớt các cột thừa như id/uuid/created_at
+// để giảm dung lượng phản hồi từ Supabase — có ảnh hưởng rõ với các khoảng thời gian dài)
+const RAW_DATA_SELECT_COLS = [
+  'device_timestamp', 'dw_toc', 'dw_conductivity', 'dw_temperature',
+  'pw_toc', 'pw_conductivity', 'pw_temperature',
+].join(',');
+
+// ============================================================
+// HOOK: lấy dữ liệu THÔ (1 điểm đo/phút) theo khoảng thời gian
+// Tự phân trang SONG SONG để vượt giới hạn mặc định 1000 dòng/request của PostgREST
+// ============================================================
+async function fetchAllRows(uuid, fromIso, toIso, accessToken) {
+  const headers = buildHeaders(accessToken);
+  const buildUrl = (offset, limit) =>
+    `${REST_BASE}/toc_data_raw?uuid=eq.${encodeURIComponent(uuid)}` +
+    `&device_timestamp=gte.${encodeURIComponent(fromIso)}` +
+    `&device_timestamp=lte.${encodeURIComponent(toIso)}` +
+    `&select=${RAW_DATA_SELECT_COLS}` +
+    `&order=device_timestamp.asc&limit=${limit}&offset=${offset}`;
+  return fetchPagedParallel(buildUrl, headers, expectedCount(fromIso, toIso));
+}
+
 
 function useRawData(uuid, fromIso, toIso, accessToken) {
   const [rawRows, setRawRows] = useState([]);
@@ -412,32 +470,26 @@ function parseNumericText(raw) {
   return Number.isNaN(n) ? null : n;
 }
 
+// Các cột thực sự dùng tới trong bảng "TOC upload report" (giảm dung lượng phản hồi)
+const UPLOAD_SELECT_COLS = [UPLOAD_COL_TIME, ...Object.values(UPLOAD_FIELD_MAP)]
+  .map(encodeURIComponent).join(',');
+
 async function fetchAllRowsUpload(deviceId, fromIso, toIso, accessToken) {
-  const PAGE_SIZE = 1000;
-  let allRows = [];
-  let offset = 0;
   const headers = buildHeaders(accessToken);
   const table = encodeURIComponent(UPLOAD_TABLE);
   const colDevice = encodeURIComponent(UPLOAD_COL_DEVICE);
   const colTime = encodeURIComponent(UPLOAD_COL_TIME);
 
-  while (true) {
-    const url = `${REST_BASE}/${table}?${colDevice}=eq.${encodeURIComponent(deviceId)}` +
-      `&${colTime}=gte.${encodeURIComponent(fromIso)}` +
-      `&${colTime}=lte.${encodeURIComponent(toIso)}` +
-      `&order=${colTime}.asc&limit=${PAGE_SIZE}&offset=${offset}`;
-    const res = await fetch(url, { headers });
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
-    }
-    const rows = await res.json();
-    allRows = allRows.concat(rows);
-    if (rows.length < PAGE_SIZE) break;
-    offset += PAGE_SIZE;
-    if (offset > 200000) break;
-  }
-  return allRows;
+  const buildUrl = (offset, limit) =>
+    `${REST_BASE}/${table}?${colDevice}=eq.${encodeURIComponent(deviceId)}` +
+    `&${colTime}=gte.${encodeURIComponent(fromIso)}` +
+    `&${colTime}=lte.${encodeURIComponent(toIso)}` +
+    `&select=${UPLOAD_SELECT_COLS}` +
+    `&order=${colTime}.asc&limit=${limit}&offset=${offset}`;
+
+  // Không ước lượng số dòng kỳ vọng (dữ liệu upload thường thưa và không đều đặn theo phút)
+  // -> dùng mặc định 2 trang song song ban đầu, phần còn lại (nếu có) tự lấy tiếp tuần tự.
+  return fetchPagedParallel(buildUrl, headers, null);
 }
 
 function extractUploadSeries(rawRows, waterKey, metricKey) {
@@ -648,6 +700,39 @@ function StatCard({ label, value, unit, highlight, color }) {
 // ============================================================
 // COMPONENT: Khối biểu đồ cho 1 (water_type, metric)
 // ============================================================
+// Giảm số điểm hiển thị trên biểu đồ (KHÔNG ảnh hưởng số liệu thống kê — vốn luôn tính trên
+// toàn bộ dữ liệu gốc). Vẽ hàng chục nghìn điểm SVG cùng lúc là nguyên nhân chính khiến trang
+// bị đơ/chậm sau khi tải xong dữ liệu, đặc biệt với khoảng 7 ngày / 30 ngày.
+// Mỗi "bucket" giữ lại điểm min & max (giữ được đỉnh/đáy thật của dữ liệu) và LUÔN giữ lại
+// mọi điểm vi phạm spec để không bị mất cảnh báo trên biểu đồ.
+function downsampleForChart(data, maxPoints = 2000) {
+  if (!data || data.length <= maxPoints) return data;
+  const bucketCount = Math.max(1, Math.floor(maxPoints / 2));
+  const bucketSize = Math.ceil(data.length / bucketCount);
+  const seen = new Set();
+  const out = [];
+  const pushUnique = (idx) => {
+    if (idx === null || idx === undefined || seen.has(idx)) return;
+    seen.add(idx);
+    out.push(data[idx]);
+  };
+  for (let i = 0; i < data.length; i += bucketSize) {
+    const end = Math.min(i + bucketSize, data.length);
+    let minIdx = null, maxIdx = null;
+    for (let j = i; j < end; j++) {
+      const v = data[j].value;
+      if (data[j].violation !== null && data[j].violation !== undefined) pushUnique(j);
+      if (v === null || v === undefined) continue;
+      if (minIdx === null || v < data[minIdx].value) minIdx = j;
+      if (maxIdx === null || v > data[maxIdx].value) maxIdx = j;
+    }
+    pushUnique(minIdx);
+    pushUnique(maxIdx);
+  }
+  out.sort((a, b) => a.timeMs - b.timeMs);
+  return out;
+}
+
 function MetricBlock({ waterType, metric, points, specLimit, loading }) {
   const stats = useMemo(() => aggregateStatsRaw(points, metric.hasSpec ? specLimit : null), [points, specLimit]);
 
@@ -668,6 +753,10 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
     if (!chartData.length) return [0, 1];
     return [chartData[0].timeMs, chartData[chartData.length - 1].timeMs];
   }, [chartData]);
+
+  // Dữ liệu THẬT dùng để vẽ (đã giảm mẫu nếu quá nhiều điểm) — số liệu thống kê phía trên
+  // vẫn luôn được tính trên `points`/`chartData` đầy đủ, không bị ảnh hưởng.
+  const displayChartData = useMemo(() => downsampleForChart(chartData, 2000), [chartData]);
 
   const tickFormatterTime = (ms) => {
     const d = new Date(ms);
@@ -724,7 +813,7 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
       h('div', { style: { marginBottom: 18 } },
         h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, `Xu hướng theo thời gian (từng điểm đo thật, 1 phút/lần — ${stats.totalPoints.toLocaleString('vi-VN')} điểm)`),
         h(ResponsiveContainer, { width: '100%', height: 220 },
-          h(LineChart, { data: chartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
+          h(LineChart, { data: displayChartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
             h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
             h(XAxis, {
               dataKey: 'timeMs', type: 'number', domain: timeDomain, scale: 'time',
@@ -749,7 +838,7 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
       h('div', null,
         h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, 'Biểu đồ kiểm soát (Control Chart — UCL/LCL = mean ± 3σ, tính trên toàn bộ khoảng đã chọn)'),
         h(ResponsiveContainer, { width: '100%', height: 220 },
-          h(ComposedChart, { data: chartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
+          h(ComposedChart, { data: displayChartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
             h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
             h(XAxis, {
               dataKey: 'timeMs', type: 'number', domain: timeDomain, scale: 'time',
@@ -1127,6 +1216,56 @@ const ALL_MONTHS = Array.from({ length: 12 }, (_, i) => i + 1);
 
 // Xây các kỳ từ danh sách tháng bất kỳ (không cần liên tiếp) trong 1 năm cho trước
 // (mỗi tháng = 1 kỳ, từ ngày 1 đến ngày cuối tháng)
+// HÀM còn thiếu — chuyển 1 chuỗi điểm {timeMs, value} thành trục "số giờ trôi qua kể từ đầu kỳ"
+// để chồng nhiều kỳ (khác ngày/tháng) lên cùng 1 biểu đồ so sánh hình dạng xu hướng.
+// Đồng thời giảm mẫu (downsample) để không vẽ hàng chục nghìn điểm/kỳ gây đơ trang.
+function elapsedHoursSeries(points, startMs, maxPoints = 1500) {
+  const series = (points || [])
+    .filter(p => p.value !== null && p.value !== undefined)
+    .map(p => ({
+      elapsedH: (p.timeMs - startMs) / 3600000,
+      value: p.value,
+      time: p.time,
+      timeMs: p.timeMs,
+      timeLabel: p.timeLabel,
+    }));
+  return downsampleForChart(series, maxPoints);
+}
+
+// HÀM còn thiếu — gộp nhiều chuỗi giá trị (mỗi kỳ 1 chuỗi) thành các "bin" histogram dùng chung
+// một trục X để so sánh phân phối giữa các kỳ. Dùng vòng lặp (không dùng Math.min/max(...array))
+// để không bị tràn ngăn xếp khi 1 kỳ có hàng chục nghìn điểm dữ liệu thô.
+function buildHistogram(seriesList, binCount = 16) {
+  let min = Infinity, max = -Infinity;
+  for (const s of seriesList) {
+    for (const v of s.values) {
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return { bins: [] };
+
+  const range = (max - min) || 1;
+  const binSize = range / binCount;
+  const bins = Array.from({ length: binCount }, (_, i) => {
+    const lo = min + i * binSize;
+    const hi = (i === binCount - 1) ? max : lo + binSize;
+    const bin = { binLabel: `${fmtNum(lo, 1)}–${fmtNum(hi, 1)}` };
+    for (const s of seriesList) bin[s.id] = 0;
+    return bin;
+  });
+
+  for (const s of seriesList) {
+    for (const v of s.values) {
+      let idx = binSize > 0 ? Math.floor((v - min) / binSize) : 0;
+      if (idx >= binCount) idx = binCount - 1;
+      if (idx < 0) idx = 0;
+      bins[idx][s.id] += 1;
+    }
+  }
+  return { bins };
+}
+
 function buildPeriodsForMonths(year, months) {
   const sorted = [...months].sort((a, b) => a - b);
   return sorted.map(m => ({
