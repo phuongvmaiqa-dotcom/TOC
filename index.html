@@ -1124,128 +1124,20 @@ function buildWeeklyPeriods(year, month) {
 }
 
 // N tháng gần nhất tính đến hiện tại (mỗi tháng = 1 kỳ, từ ngày 1 đến ngày cuối tháng)
-import React, { useState } from "react";
-
-function daysInMonthOf(year, month) {
-  return new Date(year, month, 0).getDate();
+function buildMonthlyPeriods(monthsBack) {
+  const now = new Date();
+  const out = [];
+  for (let i = monthsBack - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const y = d.getFullYear(), m = d.getMonth() + 1;
+    out.push({
+      label: `Tháng ${String(m).padStart(2, '0')}/${y}`,
+      from: toLocalIso(y, m, 1, 0, 0, 0),
+      to: toLocalIso(y, m, daysInMonthOf(y, m), 23, 59, 59),
+    });
+  }
+  return out;
 }
-
-// SỬA: thêm offset +07:00 để Supabase/n8n hiểu đúng giờ Việt Nam
-function toVNIso(year, month, day, hour, minute, second) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${year}-${pad(month)}-${pad(day)}T${pad(hour)}:${pad(minute)}:${pad(second)}+07:00`;
-}
-
-function buildMonthlyPeriods(selectedMonths, year) {
-  return [...selectedMonths]
-    .sort((a, b) => a - b)
-    .map((month) => ({
-      month,
-      year,
-      label: `Tháng ${String(month).padStart(2, "0")}/${year}`,
-      from: toVNIso(year, month, 1, 0, 0, 0),
-      to: toVNIso(year, month, daysInMonthOf(year, month), 23, 59, 59),
-    }));
-}
-
-// onPeriodsReady: callback nhận danh sách kỳ đã chọn để gọi API tiếp theo
-function MonthSelector({ onPeriodsReady }) {
-  const currentYear = new Date().getFullYear();
-  const months = Array.from({ length: 12 }, (_, i) => ({
-    value: i + 1,
-    label: `Tháng ${String(i + 1).padStart(2, "0")}`,
-  }));
-
-  const [selectedMonths, setSelectedMonths] = useState([]);
-  const [year, setYear] = useState(currentYear);
-
-  const toggleMonth = (month) => {
-    setSelectedMonths((prev) =>
-      prev.includes(month)
-        ? prev.filter((m) => m !== month)
-        : [...prev, month]
-    );
-  };
-
-  const handleLoad = () => {
-    if (selectedMonths.length === 0) {
-      alert("Vui lòng chọn ít nhất một tháng");
-      return;
-    }
-    const periods = buildMonthlyPeriods(selectedMonths, year);
-    // GỌI CALLBACK lên component cha để xử lý (gọi API, gửi báo cáo...)
-    if (onPeriodsReady) onPeriodsReady(periods);
-  };
-
-  return (
-    <div style={{ padding: "16px", background: "#f8fafc", borderRadius: 10, border: "1px solid #e2e8f0" }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 14 }}>
-        <b style={{ fontSize: 14 }}>📅 Chọn tháng báo cáo</b>
-        <label style={{ fontSize: 13 }}>
-          Năm:{" "}
-          <input
-            type="number"
-            value={year}
-            min={2020}
-            max={currentYear}
-            onChange={(e) => setYear(Number(e.target.value))}
-            style={{ width: 80, padding: "3px 6px", borderRadius: 5, border: "1px solid #cbd5e1", fontSize: 13 }}
-          />
-        </label>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: "8px", marginBottom: 14 }}>
-        {months.map((item) => (
-          <label key={item.value} style={{
-            display: "flex", alignItems: "center", gap: 6, cursor: "pointer",
-            padding: "6px 8px", borderRadius: 6, fontSize: 13,
-            background: selectedMonths.includes(item.value) ? "#dbeafe" : "#fff",
-            border: `1px solid ${selectedMonths.includes(item.value) ? "#3b82f6" : "#e2e8f0"}`,
-            fontWeight: selectedMonths.includes(item.value) ? 600 : 400,
-          }}>
-            <input
-              type="checkbox"
-              checked={selectedMonths.includes(item.value)}
-              onChange={() => toggleMonth(item.value)}
-              style={{ accentColor: "#3b82f6" }}
-            />
-            {item.label}
-          </label>
-        ))}
-      </div>
-
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <button
-          onClick={() => setSelectedMonths([1,2,3,4,5,6,7,8,9,10,11,12])}
-          style={{ padding: "6px 10px", fontSize: 12, borderRadius: 5, border: "1px solid #cbd5e1", background: "#fff", cursor: "pointer" }}
-        >Chọn tất cả</button>
-        <button
-          onClick={() => setSelectedMonths([])}
-          style={{ padding: "6px 10px", fontSize: 12, borderRadius: 5, border: "1px solid #cbd5e1", background: "#fff", cursor: "pointer" }}
-        >Bỏ chọn</button>
-        <button
-          onClick={handleLoad}
-          disabled={selectedMonths.length === 0}
-          style={{
-            padding: "6px 14px", fontSize: 13, fontWeight: 700, borderRadius: 5,
-            border: "none", background: "#3b82f6", color: "#fff", cursor: "pointer",
-            opacity: selectedMonths.length === 0 ? 0.5 : 1, marginLeft: "auto"
-          }}
-        >
-          📥 Lấy dữ liệu ({selectedMonths.length} tháng)
-        </button>
-      </div>
-
-      {selectedMonths.length > 0 && (
-        <div style={{ marginTop: 10, fontSize: 12, color: "#64748b" }}>
-          Đã chọn: {[...selectedMonths].sort((a,b)=>a-b).map(m => `T${String(m).padStart(2,'0')}`).join(", ")} / {year}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default MonthSelector;
 
 function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
   const [periods, setPeriods] = useState([]);
