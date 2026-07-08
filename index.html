@@ -57,6 +57,9 @@ import {
   ReferenceLine, Scatter, ComposedChart, BarChart, Bar, ErrorBar, Legend, Cell
 } from 'https://esm.sh/recharts@2.10.3?deps=react@18.2.0,react-dom@18.2.0';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import * as XLSX from 'https://esm.sh/xlsx@0.18.5';
+import { jsPDF } from 'https://esm.sh/jspdf@2.5.1';
+import html2canvas from 'https://esm.sh/html2canvas@1.4.1';
 
 const h = React.createElement;
 const { useState, useEffect, useMemo, useCallback, useRef, Fragment } = React;
@@ -141,6 +144,132 @@ const STAT_COLORS = {
 
 // Bảng màu luân phiên dùng cho nhiều "khoảng thời gian" trên trang so sánh
 const PERIOD_PALETTE = ['#2563eb', '#dc2626', '#16a34a', '#d97706', '#7c3aed', '#0891b2', '#db2777', '#4b5563'];
+
+// Chụp 1 khối DOM (bảng số liệu + biểu đồ SVG) thành ảnh rồi ghép vào file PDF nhiều trang (A4).
+// Chạy hoàn toàn trên trình duyệt — không cần gọi n8n hay bất kỳ server nào.
+async function exportNodeToPdf(node, filename, titleText) {
+  if (!node) throw new Error('Không tìm thấy nội dung để xuất báo cáo.');
+  const canvas = await html2canvas(node, {
+    scale: 2, backgroundColor: '#ffffff', useCORS: true, logging: false
+  });
+  const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+  const pageWidth = pdf.internal.pageSize.getWidth();
+  const pageHeight = pdf.internal.pageSize.getHeight();
+  const margin = 24;
+  const usableWidth = pageWidth - margin * 2;
+  const imgWidth = usableWidth;
+  const imgHeight = (canvas.height * imgWidth) / canvas.width;
+  const imgData = canvas.toDataURL('image/png');
+
+  let topOffset = margin;
+  if (titleText) {
+    pdf.setFontSize(13);
+    pdf.text(titleText, margin, topOffset + 4);
+    topOffset += 22;
+  }
+
+  let heightLeft = imgHeight;
+  let position = topOffset;
+  const usableHeight = pageHeight - margin * 2;
+  pdf.addImage(imgData, 'PNG', margin, position, imgWidth, imgHeight);
+  heightLeft -= (usableHeight - (topOffset - margin));
+
+  while (heightLeft > 0) {
+    position = margin - (imgHeight - heightLeft);
+    pdf.addPage();
+    pdf.addImage(imgData, 'PNG', margin, position, imgWidth, imgHeight);
+    heightLeft -= usableHeight;
+  }
+  pdf.save(filename);
+}
+
+// Hồi quy tuyến tính đơn giản (least squares) trên trục "giờ trôi qua" để phát hiện xu hướng tăng/giảm
+function computeTrendSlope(points) {
+  const valid = points.filter(p => p.value !== null && p.value !== undefined);
+  if (valid.length < 3) return null;
+  const x0 = valid[0].timeMs;
+  const xs = valid.map(p => (p.timeMs - x0) / 3600000); // giờ
+  const ys = valid.map(p => p.value);
+  const n = xs.length;
+  const sumX = xs.reduce((a, b) => a + b, 0), sumY = ys.reduce((a, b) => a + b, 0);
+  const sumXY = xs.reduce((a, x, i) => a + x * ys[i], 0);
+  const sumXX = xs.reduce((a, x) => a + x * x, 0);
+  const denom = n * sumXX - sumX * sumX;
+  if (denom === 0) return 0;
+  return (n * sumXY - sumX * sumY) / denom; // đơn vị: giá trị / giờ
+}
+
+// Sinh nhận xét tự động (đánh giá) cho 1 chuỗi dữ liệu: biến động, spec, thiếu dữ liệu, xu hướng
+function evaluateColumn(points, stats, specLimit, unit) {
+  if (!stats || stats.totalPoints === 0) {
+    return { level: 'warn', lines: ['Không có đủ dữ liệu hợp lệ trong khoảng này để đánh giá.'] };
+  }
+  const lines = [];
+  let level = 'ok'; // ok | warn | danger
+
+  const cv = stats.mean ? Math.abs(stats.sd / stats.mean) * 100 : null;
+  if (cv !== null) {
+    if (cv > 15) { lines.push(`Biến động cao (CV = ${cv.toFixed(1)}%) — dữ liệu dao động mạnh quanh giá trị trung bình.`); level = 'warn'; }
+    else if (cv > 5) { lines.push(`Biến động ở mức trung bình (CV = ${cv.toFixed(1)}%).`); }
+    else { lines.push(`Dữ liệu khá ổn định quanh giá trị trung bình (CV = ${cv.toFixed(1)}%).`); }
+  }
+
+  if (specLimit !== null && specLimit !== undefined && !Number.isNaN(specLimit)) {
+    const rate = stats.totalPoints ? (stats.specViolations / stats.totalPoints) * 100 : 0;
+    if (stats.specViolations > 0) {
+      lines.push(`⚠️ Có ${stats.specViolations}/${stats.totalPoints} điểm (${rate.toFixed(1)}%) vượt ngưỡng spec ${specLimit} ${unit}.`);
+      level = 'danger';
+    } else {
+      const margin = specLimit ? (stats.max / specLimit) * 100 : 0;
+      if (margin > 85) {
+        lines.push(`Chưa vượt spec, nhưng giá trị cao nhất (${stats.max.toFixed(2)} ${unit}) đã gần chạm ngưỡng ${specLimit} ${unit} (${margin.toFixed(0)}%).`);
+        if (level === 'ok') level = 'warn';
+      } else {
+        lines.push(`Không có điểm nào vượt ngưỡng spec ${specLimit} ${unit}.`);
+      }
+    }
+  }
+
+  if (stats.missRate > 10) { lines.push(`⚠️ Thiếu dữ liệu đáng kể (${fmtNum(stats.missRate, 1)}%).`); level = level === 'danger' ? level : 'warn'; }
+  else if (stats.missRate > 2) { lines.push(`Thiếu dữ liệu nhẹ (${fmtNum(stats.missRate, 1)}%).`); }
+
+  const slope = computeTrendSlope(points);
+  if (slope !== null) {
+    const changePerDay = slope * 24;
+    const noiseFloor = (stats.sd || 0.01) * 0.2;
+    if (Math.abs(changePerDay) < noiseFloor) {
+      lines.push('Không thấy xu hướng tăng/giảm rõ rệt theo thời gian trong khoảng này.');
+    } else if (slope > 0) {
+      lines.push(`Có xu hướng tăng dần theo thời gian (~${fmtNum(changePerDay, 3)} ${unit}/ngày).`);
+      if (level === 'ok') level = 'warn';
+    } else {
+      lines.push(`Có xu hướng giảm dần theo thời gian (~${fmtNum(Math.abs(changePerDay), 3)} ${unit}/ngày).`);
+    }
+  }
+
+  return { level, lines };
+}
+
+// Thẻ hiển thị kết quả đánh giá tự động cho 1 cột/thông số
+function EvaluationCard({ title, evaluation, color }) {
+  const palette = {
+    ok: { bg: '#f0fdf4', border: '#bbf7d0', text: '#15803d', badge: '✅ Bình thường' },
+    warn: { bg: '#fffbeb', border: '#fde68a', text: '#b45309', badge: '⚠️ Cần chú ý' },
+    danger: { bg: '#fef2f2', border: '#fecaca', text: '#b91c1c', badge: '🚨 Vượt ngưỡng' },
+  };
+  const p = palette[evaluation.level] || palette.ok;
+  return h('div', {
+    style: { background: p.bg, border: `1px solid ${p.border}`, borderLeft: `4px solid ${color || p.text}`, borderRadius: 10, padding: '12px 16px', marginBottom: 10 }
+  },
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 } },
+      h('span', { style: { fontSize: 13, fontWeight: 800, color: '#0f172a' } }, title),
+      h('span', { style: { fontSize: 11, fontWeight: 700, color: p.text, background: '#fff', border: `1px solid ${p.border}`, borderRadius: 999, padding: '2px 8px' } }, p.badge)
+    ),
+    h('ul', { style: { margin: 0, paddingLeft: 18, color: '#334155', fontSize: 12.5, lineHeight: 1.6 } },
+      evaluation.lines.map((line, i) => h('li', { key: i }, line))
+    )
+  );
+}
 
 // ============================================================
 // HOOK: quản lý phiên đăng nhập Supabase Auth
@@ -936,6 +1065,26 @@ function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
 
+  const reportRef = useRef(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportError, setExportError] = useState('');
+
+  const handleExportPdf = useCallback(async () => {
+    setExportError(''); setExportingPdf(true);
+    try {
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      await exportNodeToPdf(
+        reportRef.current,
+        `bao-cao-so-sanh_${waterTypeKey}_${metricKey}_${stamp}.pdf`,
+        `Báo cáo so sánh dữ liệu — ${waterType.label} · ${metric.label} — ${new Date().toLocaleString('vi-VN')}`
+      );
+    } catch (err) {
+      setExportError('Không xuất được PDF: ' + (err.message || String(err)));
+    } finally {
+      setExportingPdf(false);
+    }
+  }, [waterTypeKey, metricKey, waterType, metric]);
+
   const addPeriods = useCallback((defs) => {
     setPeriods(prev => {
       const added = defs.map((d, i) => ({
@@ -1003,8 +1152,19 @@ function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
         value: metricKey, onChange: (e) => setMetricKey(e.target.value),
         style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
       }, METRICS.map(m => h('option', { key: m.key, value: m.key }, `${m.label} (${m.unit})`))),
-      loading ? h('span', { style: { color: '#38bdf8', fontSize: 12 } }, '⏳ Đang tải...') : null
+      loading ? h('span', { style: { color: '#38bdf8', fontSize: 12 } }, '⏳ Đang tải...') : null,
+      h('button', {
+        onClick: handleExportPdf,
+        disabled: exportingPdf || periods.length === 0,
+        style: {
+          marginLeft: 'auto', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '7px 14px', fontSize: 12, fontWeight: 700,
+          cursor: (exportingPdf || periods.length === 0) ? 'not-allowed' : 'pointer',
+          opacity: (exportingPdf || periods.length === 0) ? 0.5 : 1
+        }
+      }, exportingPdf ? '⏳ Đang tạo PDF...' : '📄 Xuất báo cáo PDF')
     ),
+    exportError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 10, borderRadius: 8, marginBottom: 16, fontSize: 12.5 } }, exportError) : null,
 
     h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12, marginBottom: 16 } },
       h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #2563eb' } },
@@ -1095,7 +1255,7 @@ function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
       style: { color: '#94a3b8', fontSize: 13, marginBottom: 18, textAlign: 'center', padding: 20, border: '1px dashed #cbd5e1', borderRadius: 10 }
     }, 'Chưa có khoảng thời gian nào — hãy thêm ít nhất 2 khoảng để so sánh.'),
 
-    periods.length === 0 ? null : h(Fragment, null,
+    periods.length === 0 ? null : h('div', { ref: reportRef },
       h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20, overflowX: 'auto' } },
         h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 10 } }, `Bảng so sánh — ${waterType.label} · ${metric.label} (${metric.unit})`),
         h('table', { style: { borderCollapse: 'collapse', width: '100%', fontSize: 12.5, minWidth: 780 } },
@@ -1184,6 +1344,261 @@ function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
         )
       ) : null
     )
+  );
+}
+
+// ============================================================
+// TRANG TẢI EXCEL LÊN — đọc file .xlsx/.xls/.csv ngay trên trình duyệt (không ghi vào Supabase)
+// và tái dùng MetricBlock để phân tích thống kê + biểu đồ cho các cột số liệu do người dùng chọn
+// ============================================================
+function parseCellToDate(v) {
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? null : v;
+  if (typeof v === 'number') {
+    // Fallback cho ô ngày dạng số serial Excel khi cellDates không tự chuyển được
+    const parsed = XLSX.SSF && XLSX.SSF.parse_date_code ? XLSX.SSF.parse_date_code(v) : null;
+    if (!parsed) return null;
+    return new Date(Date.UTC(parsed.y, parsed.m - 1, parsed.d, parsed.H || 0, parsed.M || 0, Math.floor(parsed.S || 0)));
+  }
+  if (typeof v === 'string' && v.trim()) {
+    const d = new Date(v);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+  return null;
+}
+
+// Chuyển các dòng JSON đã đọc từ sheet thành mảng điểm {time, timeMs, timeLabel, value} — đúng định dạng MetricBlock đang dùng
+function buildPointsFromRows(rows, timestampCol, valueCol) {
+  const pts = [];
+  for (const r of rows) {
+    const d = parseCellToDate(r[timestampCol]);
+    if (!d) continue;
+    const raw = r[valueCol];
+    const num = (raw === null || raw === undefined || raw === '') ? null : Number(raw);
+    pts.push({
+      time: d.toISOString(), timeMs: d.getTime(), timeLabel: fmtDateShort(d.toISOString()),
+      value: (num === null || Number.isNaN(num)) ? null : num,
+    });
+  }
+  pts.sort((a, b) => a.timeMs - b.timeMs);
+  return pts;
+}
+
+function ExcelImportPage() {
+  const [fileName, setFileName] = useState('');
+  const [sheetNames, setSheetNames] = useState([]);
+  const [selectedSheet, setSelectedSheet] = useState('');
+  const [workbook, setWorkbook] = useState(null);
+  const [jsonRows, setJsonRows] = useState([]);
+  const [columns, setColumns] = useState([]);
+  const [timestampCol, setTimestampCol] = useState('');
+  const [valueColsConfig, setValueColsConfig] = useState({}); // { colName: {enabled, label, unit, specLimit, color} }
+  const [error, setError] = useState('');
+  const [parsing, setParsing] = useState(false);
+
+  const reportRef = useRef(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportError, setExportError] = useState('');
+
+  const handleExportPdf = useCallback(async () => {
+    setExportError(''); setExportingPdf(true);
+    try {
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      await exportNodeToPdf(
+        reportRef.current,
+        `bao-cao-excel_${(fileName || 'du-lieu').replace(/\.[^.]+$/, '')}_${stamp}.pdf`,
+        `Báo cáo phân tích Excel — ${fileName} — ${new Date().toLocaleString('vi-VN')}`
+      );
+    } catch (err) {
+      setExportError('Không xuất được PDF: ' + (err.message || String(err)));
+    } finally {
+      setExportingPdf(false);
+    }
+  }, [fileName]);
+
+  const handleFile = useCallback((file) => {
+    if (!file) return;
+    setError(''); setParsing(true); setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb = XLSX.read(data, { type: 'array', cellDates: true });
+        setWorkbook(wb);
+        setSheetNames(wb.SheetNames);
+        setSelectedSheet(wb.SheetNames[0] || '');
+      } catch (err) {
+        setError('Không đọc được file: ' + (err.message || String(err)));
+      } finally {
+        setParsing(false);
+      }
+    };
+    reader.onerror = () => { setError('Lỗi đọc file.'); setParsing(false); };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  useEffect(() => {
+    if (!workbook || !selectedSheet) return;
+    try {
+      const ws = workbook.Sheets[selectedSheet];
+      const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
+      setJsonRows(rows);
+      const cols = rows.length ? Object.keys(rows[0]) : [];
+      setColumns(cols);
+
+      // Đoán cột thời gian: ưu tiên tên cột gợi ý, sau đó cột có chứa giá trị kiểu Date
+      const guessTs = cols.find(c => /time|date|ngày|thời gian|timestamp/i.test(c))
+        || cols.find(c => rows.some(r => r[c] instanceof Date));
+      const tsCol = guessTs || cols[0] || '';
+      setTimestampCol(tsCol);
+
+      // Đoán các cột số liệu (numeric) còn lại, mặc định bật tối đa 4 cột đầu tiên
+      const cfg = {};
+      let numericIdx = 0;
+      cols.forEach((c) => {
+        if (c === tsCol) return;
+        const isNumeric = rows.some(r => r[c] !== null && r[c] !== '' && !Number.isNaN(Number(r[c])));
+        if (!isNumeric) return;
+        cfg[c] = {
+          enabled: numericIdx < 4,
+          label: c,
+          unit: /toc/i.test(c) ? 'ppb' : (/conduct|dẫn/i.test(c) ? 'µS/cm' : (/temp|nhiệt/i.test(c) ? '°C' : '')),
+          specLimit: /toc/i.test(c) ? TOC_SPEC_LIMIT : null,
+          color: PERIOD_PALETTE[numericIdx % PERIOD_PALETTE.length],
+        };
+        numericIdx += 1;
+      });
+      setValueColsConfig(cfg);
+      setError('');
+    } catch (err) {
+      setError('Không đọc được dữ liệu trong sheet: ' + (err.message || String(err)));
+    }
+  }, [workbook, selectedSheet]);
+
+  const activeValueCols = Object.entries(valueColsConfig).filter(([, c]) => c.enabled);
+
+  const seriesByCol = useMemo(() => {
+    const out = {};
+    if (!timestampCol) return out;
+    activeValueCols.forEach(([col]) => { out[col] = buildPointsFromRows(jsonRows, timestampCol, col); });
+    return out;
+    // eslint-disable-next-line
+  }, [jsonRows, timestampCol, valueColsConfig]);
+
+  const statsByCol = useMemo(() => {
+    const out = {};
+    activeValueCols.forEach(([col, cfg]) => { out[col] = aggregateStatsRaw(seriesByCol[col] || [], cfg.specLimit); });
+    return out;
+    // eslint-disable-next-line
+  }, [seriesByCol, valueColsConfig]);
+
+  const updateColCfg = (col, patch) => setValueColsConfig(prev => ({ ...prev, [col]: { ...prev[col], ...patch } }));
+
+  return h('div', { style: { marginTop: 4 } },
+    h('div', {
+      style: {
+        background: 'linear-gradient(120deg, #0f172a, #0f766e)', borderRadius: 12, padding: '16px 20px',
+        display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center', marginBottom: 16
+      }
+    },
+      h('span', { style: { color: '#fff', fontWeight: 700, fontSize: 14 } }, '📁 Tải file Excel lên để phân tích'),
+      h('label', {
+        style: { background: '#14b8a6', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 14px', fontSize: 12, fontWeight: 700, cursor: 'pointer' }
+      },
+        parsing ? '⏳ Đang đọc...' : (fileName ? `📄 ${fileName}` : '+ Chọn file .xlsx / .csv'),
+        h('input', {
+          type: 'file', accept: '.xlsx,.xls,.csv', style: { display: 'none' },
+          onChange: (e) => handleFile(e.target.files && e.target.files[0])
+        })
+      ),
+      sheetNames.length > 1 ? h('select', {
+        value: selectedSheet, onChange: (e) => setSelectedSheet(e.target.value),
+        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, sheetNames.map(s => h('option', { key: s, value: s }, s))) : null,
+      jsonRows.length ? h('span', { style: { color: '#99f6e4', fontSize: 12 } }, `${jsonRows.length.toLocaleString('vi-VN')} dòng dữ liệu`) : null,
+      h('button', {
+        onClick: handleExportPdf,
+        disabled: exportingPdf || !jsonRows.length,
+        style: {
+          marginLeft: 'auto', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '7px 14px', fontSize: 12, fontWeight: 700,
+          cursor: (exportingPdf || !jsonRows.length) ? 'not-allowed' : 'pointer',
+          opacity: (exportingPdf || !jsonRows.length) ? 0.5 : 1
+        }
+      }, exportingPdf ? '⏳ Đang tạo PDF...' : '📄 Xuất báo cáo PDF')
+    ),
+    exportError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 10, borderRadius: 8, marginBottom: 16, fontSize: 12.5 } }, exportError) : null,
+
+    error ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, error) : null,
+
+    !fileName ? h('div', {
+      style: { color: '#94a3b8', fontSize: 13, textAlign: 'center', padding: 40, border: '1px dashed #cbd5e1', borderRadius: 10 }
+    }, 'Chọn 1 file Excel (.xlsx/.xls) hoặc CSV có 1 cột thời gian và các cột số liệu (TOC, độ dẫn, nhiệt độ...) để bắt đầu phân tích. Dữ liệu chỉ được xử lý ngay trên trình duyệt của bạn — chưa được ghi vào Supabase.')
+      : (columns.length === 0 ? null : h(Fragment, null,
+
+        h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+          h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 10 } }, 'Cấu hình cột dữ liệu'),
+          h('div', { style: { display: 'flex', gap: 8, alignItems: 'center', marginBottom: 14, flexWrap: 'wrap' } },
+            h('span', { style: { fontSize: 12, color: '#64748b', fontWeight: 600 } }, 'Cột thời gian:'),
+            h('select', {
+              value: timestampCol, onChange: (e) => setTimestampCol(e.target.value),
+              style: { border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 12 }
+            }, columns.map(c => h('option', { key: c, value: c }, c)))
+          ),
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+            columns.filter(c => c !== timestampCol && valueColsConfig[c]).map((c) => {
+              const cfg = valueColsConfig[c];
+              return h('div', {
+                key: c,
+                style: {
+                  display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap', padding: '8px 10px', borderRadius: 8,
+                  background: cfg.enabled ? hexToRgba(cfg.color, 0.06) : '#f8fafc',
+                  border: `1px solid ${cfg.enabled ? hexToRgba(cfg.color, 0.35) : '#e2e8f0'}`
+                }
+              },
+                h('input', { type: 'checkbox', checked: cfg.enabled, onChange: (e) => updateColCfg(c, { enabled: e.target.checked }) }),
+                h('span', { style: { width: 10, height: 10, borderRadius: '50%', background: cfg.color, display: 'inline-block' } }),
+                h('span', { style: { fontSize: 12.5, fontWeight: 700, color: '#0f172a', minWidth: 120 } }, c),
+                h('input', {
+                  type: 'text', value: cfg.label, placeholder: 'Nhãn hiển thị', onChange: (e) => updateColCfg(c, { label: e.target.value }),
+                  style: { border: '1px solid #cbd5e1', borderRadius: 6, padding: '4px 8px', fontSize: 11.5, width: 140 }
+                }),
+                h('input', {
+                  type: 'text', value: cfg.unit, placeholder: 'Đơn vị', onChange: (e) => updateColCfg(c, { unit: e.target.value }),
+                  style: { border: '1px solid #cbd5e1', borderRadius: 6, padding: '4px 8px', fontSize: 11.5, width: 70 }
+                }),
+                h('input', {
+                  type: 'number', value: cfg.specLimit ?? '', placeholder: 'Spec limit',
+                  onChange: (e) => updateColCfg(c, { specLimit: e.target.value === '' ? null : Number(e.target.value) }),
+                  style: { border: '1px solid #cbd5e1', borderRadius: 6, padding: '4px 8px', fontSize: 11.5, width: 90 }
+                })
+              );
+            })
+          )
+        ),
+
+        h('div', { ref: reportRef },
+          activeValueCols.length === 0
+            ? h('div', { style: { color: '#94a3b8', fontSize: 13, textAlign: 'center', padding: 20 } }, 'Chọn ít nhất 1 cột số liệu để phân tích.')
+            : h(Fragment, null,
+              h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+                h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, '🧭 Phân tích & đánh giá tự động'),
+                h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 12 } }, 'Nhận xét dựa trên biến động (CV%), vi phạm ngưỡng spec, tỷ lệ thiếu dữ liệu và xu hướng theo thời gian'),
+                activeValueCols.map(([col, cfg]) => h(EvaluationCard, {
+                  key: col, title: cfg.label || col, color: cfg.color,
+                  evaluation: evaluateColumn(seriesByCol[col] || [], statsByCol[col], cfg.specLimit, cfg.unit || '')
+                }))
+              ),
+              activeValueCols.map(([col, cfg]) => h(MetricBlock, {
+                key: col,
+                waterType: { accent: cfg.color },
+                metric: { key: col, label: cfg.label || col, unit: cfg.unit || '', hasSpec: cfg.specLimit !== null },
+                points: seriesByCol[col] || [],
+                specLimit: cfg.specLimit,
+                loading: false
+              }))
+            )
+        )
+      ))
   );
 }
 
@@ -1321,7 +1736,7 @@ function TocDashboard({ session, onLogout }) {
 
         h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
       )
-    ) : h(ComparisonPage, { devices, selectedUuid, onSelectUuid: setSelectedUuid, accessToken }),
+    ) : (activeTab === 'compare' ? h(ComparisonPage, { devices, selectedUuid, onSelectUuid: setSelectedUuid, accessToken }) : h(ExcelImportPage)),
 
     showChangePw ? h(ChangePasswordModal, { onClose: () => setShowChangePw(false) }) : null
   );
@@ -1334,6 +1749,7 @@ function TabNav({ activeTab, onChange }) {
   const tabs = [
     { key: 'dashboard', label: '📊 Dashboard', color: '#2563eb' },
     { key: 'compare', label: '🆚 So sánh dữ liệu', color: '#7c3aed' },
+    { key: 'excel', label: '📁 Tải Excel', color: '#0d9488' },
   ];
   return h('div', { style: { display: 'flex', gap: 8, margin: '14px 0' } },
     tabs.map(t => h('button', {
