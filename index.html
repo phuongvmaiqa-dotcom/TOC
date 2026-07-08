@@ -373,6 +373,153 @@ const RAW_FIELD_MAP = {
   purified_conductivity: 'pw_conductivity',
   purified_temperature: 'pw_temperature',
 };
+// ============================================================
+// CẤU HÌNH BẢNG "TOC upload report" (dùng cho trang So sánh Upload Report)
+// ============================================================
+const UPLOAD_TABLE = 'TOC upload report';
+const UPLOAD_COL_DEVICE = 'Mã thiết bị';
+const UPLOAD_COL_TIME = 'Thời gian ghi nhận';
+
+const UPLOAD_FIELD_MAP = {
+  NC_toc: 'NC - TOC (ppbTOC)',
+  NC_conductivity: 'NC - Độ dẫn',
+  NC_temperature: 'NC - Nhiệt độ (°C)',
+  NC_lampdli: 'NC - Lamp DLI',
+  NTK_toc: 'NTK - TOC (ppbTOC)',
+  NTK_conductivity: 'NTK - Độ dẫn',
+  NTK_temperature: 'NTK - Nhiệt độ (°C)',
+  NTK_lampdli: 'NTK - Lamp DLI',
+};
+
+const UPLOAD_WATER_TYPES = [
+  { key: 'NC', label: 'Nước cất (NC)', accent: '#2563eb' },
+  { key: 'NTK', label: 'Nước tinh khiết (NTK)', accent: '#0891b2' },
+];
+
+const UPLOAD_METRICS = [
+  { key: 'toc', label: 'TOC', unit: 'ppbTOC', hasSpec: true },
+  { key: 'conductivity', label: 'Độ dẫn', unit: '', hasSpec: false },
+  { key: 'temperature', label: 'Nhiệt độ', unit: '°C', hasSpec: false },
+  { key: 'lampdli', label: 'Lamp DLI', unit: '', hasSpec: false },
+];
+
+function parseNumericText(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (!s) return null;
+  let n = Number(s);
+  if (!Number.isNaN(n)) return n;
+  n = Number(s.replace(',', '.'));
+  return Number.isNaN(n) ? null : n;
+}
+
+async function fetchAllRowsUpload(deviceId, fromIso, toIso, accessToken) {
+  const PAGE_SIZE = 1000;
+  let allRows = [];
+  let offset = 0;
+  const headers = buildHeaders(accessToken);
+  const table = encodeURIComponent(UPLOAD_TABLE);
+  const colDevice = encodeURIComponent(UPLOAD_COL_DEVICE);
+  const colTime = encodeURIComponent(UPLOAD_COL_TIME);
+
+  while (true) {
+    const url = `${REST_BASE}/${table}?${colDevice}=eq.${encodeURIComponent(deviceId)}` +
+      `&${colTime}=gte.${encodeURIComponent(fromIso)}` +
+      `&${colTime}=lte.${encodeURIComponent(toIso)}` +
+      `&order=${colTime}.asc&limit=${PAGE_SIZE}&offset=${offset}`;
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+    }
+    const rows = await res.json();
+    allRows = allRows.concat(rows);
+    if (rows.length < PAGE_SIZE) break;
+    offset += PAGE_SIZE;
+    if (offset > 200000) break;
+  }
+  return allRows;
+}
+
+function extractUploadSeries(rawRows, waterKey, metricKey) {
+  const field = UPLOAD_FIELD_MAP[`${waterKey}_${metricKey}`];
+  const points = [];
+  for (const r of rawRows) {
+    const t = r[UPLOAD_COL_TIME];
+    if (!t) continue;
+    points.push({
+      time: t,
+      timeMs: new Date(t).getTime(),
+      timeLabel: fmtDateShort(t),
+      value: parseNumericText(r[field]),
+    });
+  }
+  points.sort((a, b) => a.timeMs - b.timeMs);
+  return points;
+}
+
+function useUploadReportDevices(accessToken) {
+  const [deviceIds, setDeviceIds] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!accessToken) return;
+    setLoading(true);
+    const table = encodeURIComponent(UPLOAD_TABLE);
+    const colDevice = encodeURIComponent(UPLOAD_COL_DEVICE);
+    const colTime = encodeURIComponent(UPLOAD_COL_TIME);
+    const url = `${REST_BASE}/${table}?select=${colDevice}&order=${colTime}.desc&limit=5000`;
+
+    fetch(url, { headers: buildHeaders(accessToken) })
+      .then(async (res) => {
+        if (!res.ok) {
+          const txt = await res.text();
+          throw new Error(`HTTP ${res.status}: ${txt.slice(0, 200)}`);
+        }
+        return res.json();
+      })
+      .then((rows) => {
+        const ids = Array.from(new Set(
+          rows.map(r => r[UPLOAD_COL_DEVICE]).filter(v => v !== null && v !== undefined)
+        )).sort((a, b) => a - b);
+        setDeviceIds(ids);
+        setLoading(false);
+      })
+      .catch((err) => { setError(err.message || String(err)); setLoading(false); });
+  }, [accessToken]);
+
+  return { deviceIds, loading, error };
+}
+
+function useUploadPeriodsData(periods, deviceId, waterKey, metricKey, accessToken) {
+  const [dataByPeriod, setDataByPeriod] = useState({});
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!deviceId || !accessToken || periods.length === 0) { setDataByPeriod({}); return; }
+    let cancelled = false;
+    setLoading(true);
+    Promise.all(periods.map(p =>
+      fetchAllRowsUpload(deviceId, p.from, p.to, accessToken)
+        .then(rows => {
+          const points = extractUploadSeries(rows, waterKey, metricKey);
+          const specLimit = metricKey === 'toc' ? TOC_SPEC_LIMIT : null;
+          const stats = aggregateStatsRaw(points, specLimit);
+          return [p.id, { points, stats, error: null }];
+        })
+        .catch(err => [p.id, { points: [], stats: null, error: err.message || String(err) }])
+    )).then(entries => {
+      if (cancelled) return;
+      setDataByPeriod(Object.fromEntries(entries));
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [periods, deviceId, waterKey, metricKey, accessToken]);
+
+  return { dataByPeriod, loading };
+}
+
 
 // Tính số điểm "kỳ vọng" trong khoảng thời gian (1 điểm/phút)
 function expectedCount(fromIso, toIso) {
@@ -1346,6 +1493,324 @@ function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
     )
   );
 }
+// ============================================================
+// TRANG SO SÁNH DỮ LIỆU — nguồn: bảng "TOC upload report"
+// ============================================================
+function UploadReportComparisonPage({ accessToken }) {
+  const { deviceIds, loading: devicesLoading, error: devicesError } = useUploadReportDevices(accessToken);
+  const [deviceIdInput, setDeviceIdInput] = useState('');
+
+  useEffect(() => {
+    if (deviceIds.length && !deviceIdInput) setDeviceIdInput(String(deviceIds[0]));
+  }, [deviceIds, deviceIdInput]);
+
+  const [periods, setPeriods] = useState([]);
+  const [waterTypeKey, setWaterTypeKey] = useState('NC');
+  const [metricKey, setMetricKey] = useState('toc');
+  const metric = UPLOAD_METRICS.find(m => m.key === metricKey) || UPLOAD_METRICS[0];
+  const waterType = UPLOAD_WATER_TYPES.find(w => w.key === waterTypeKey) || UPLOAD_WATER_TYPES[0];
+
+  const [monthPickYear, setMonthPickYear] = useState(new Date().getFullYear());
+  const [monthPickMonth, setMonthPickMonth] = useState(new Date().getMonth() + 1);
+  const [monthsBack, setMonthsBack] = useState(3);
+  const [customLabel, setCustomLabel] = useState('');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+
+  const reportRef = useRef(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [exportError, setExportError] = useState('');
+
+  const deviceId = deviceIdInput ? Number(deviceIdInput) : null;
+
+  const handleExportPdf = useCallback(async () => {
+    setExportError(''); setExportingPdf(true);
+    try {
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      await exportNodeToPdf(
+        reportRef.current,
+        `bao-cao-upload-report_${waterTypeKey}_${metricKey}_${stamp}.pdf`,
+        `Báo cáo so sánh (TOC upload report) — ${waterType.label} · ${metric.label} — ${new Date().toLocaleString('vi-VN')}`
+      );
+    } catch (err) {
+      setExportError('Không xuất được PDF: ' + (err.message || String(err)));
+    } finally {
+      setExportingPdf(false);
+    }
+  }, [waterTypeKey, metricKey, waterType, metric]);
+
+  const addPeriods = useCallback((defs) => {
+    setPeriods(prev => {
+      const added = defs.map((d, i) => ({
+        id: `up_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 7)}`,
+        label: d.label, from: d.from, to: d.to,
+        color: PERIOD_PALETTE[(prev.length + i) % PERIOD_PALETTE.length],
+      }));
+      return [...prev, ...added];
+    });
+  }, []);
+
+  const removePeriod = (id) => setPeriods(prev => prev.filter(p => p.id !== id));
+  const clearPeriods = () => setPeriods([]);
+
+  const { dataByPeriod, loading } = useUploadPeriodsData(periods, deviceId, waterTypeKey, metricKey, accessToken);
+
+  const rows = useMemo(() => periods.map(p => {
+    const d = dataByPeriod[p.id];
+    const stats = d?.stats;
+    const cv = (stats && stats.mean) ? (stats.sd / Math.abs(stats.mean)) * 100 : null;
+    return { period: p, stats, cv, error: d?.error };
+  }), [periods, dataByPeriod]);
+
+  const barData = useMemo(() => rows.filter(r => r.stats).map(r => ({
+    name: r.period.label, mean: r.stats.mean, sd: r.stats.sd, color: r.period.color
+  })), [rows]);
+
+  const overlaySeries = useMemo(() => periods.map(p => {
+    const d = dataByPeriod[p.id];
+    if (!d || !d.points || !d.points.length) return { period: p, data: [] };
+    const firstValid = d.points.find(pt => pt.value !== null) || d.points[0];
+    return { period: p, data: elapsedHoursSeries(d.points, firstValid.timeMs) };
+  }), [periods, dataByPeriod]);
+
+  const maxElapsed = useMemo(() => {
+    let m = 1;
+    overlaySeries.forEach(s => { if (s.data.length) m = Math.max(m, s.data[s.data.length - 1].elapsedH); });
+    return m;
+  }, [overlaySeries]);
+
+  const histSeriesList = useMemo(() => periods.map(p => {
+    const d = dataByPeriod[p.id];
+    return { id: p.id, label: p.label, color: p.color, values: (d?.points || []).filter(pt => pt.value !== null).map(pt => pt.value) };
+  }).filter(s => s.values.length), [periods, dataByPeriod]);
+
+  const { bins: histBins } = useMemo(() => buildHistogram(histSeriesList, 16), [histSeriesList]);
+
+  return h('div', { style: { marginTop: 4 } },
+    h('div', {
+      style: {
+        background: 'linear-gradient(120deg, #78350f, #b45309)', borderRadius: 12, padding: '16px 20px',
+        display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center', marginBottom: 16
+      }
+    },
+      h('span', { style: { color: '#fff', fontWeight: 700, fontSize: 14 } }, '📑 So sánh dữ liệu (TOC upload report)'),
+
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+        h('span', { style: { color: '#fde68a', fontSize: 12 } }, 'Mã thiết bị:'),
+        h('input', {
+          list: 'uploadDeviceIds', value: deviceIdInput, onChange: (e) => setDeviceIdInput(e.target.value),
+          placeholder: 'VD: 12345',
+          style: { background: '#451a03', color: '#fff', border: '1px solid #92400e', borderRadius: 6, padding: '6px 10px', fontSize: 13, width: 120 }
+        }),
+        h('datalist', { id: 'uploadDeviceIds' }, deviceIds.map(id => h('option', { key: id, value: id })))
+      ),
+
+      h('select', {
+        value: waterTypeKey, onChange: (e) => setWaterTypeKey(e.target.value),
+        style: { background: '#451a03', color: '#fde68a', border: '1px solid #92400e', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, UPLOAD_WATER_TYPES.map(w => h('option', { key: w.key, value: w.key }, w.label))),
+
+      h('select', {
+        value: metricKey, onChange: (e) => setMetricKey(e.target.value),
+        style: { background: '#451a03', color: '#fde68a', border: '1px solid #92400e', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, UPLOAD_METRICS.map(m => h('option', { key: m.key, value: m.key }, `${m.label}${m.unit ? ' (' + m.unit + ')' : ''}`))),
+
+      devicesLoading ? h('span', { style: { color: '#fde68a', fontSize: 12 } }, '⏳ Đang tải danh sách thiết bị...') : null,
+      loading ? h('span', { style: { color: '#fde68a', fontSize: 12 } }, '⏳ Đang tải dữ liệu...') : null,
+
+      h('button', {
+        onClick: handleExportPdf,
+        disabled: exportingPdf || periods.length === 0,
+        style: {
+          marginLeft: 'auto', background: '#16a34a', color: '#fff', border: 'none', borderRadius: 6,
+          padding: '7px 14px', fontSize: 12, fontWeight: 700,
+          cursor: (exportingPdf || periods.length === 0) ? 'not-allowed' : 'pointer',
+          opacity: (exportingPdf || periods.length === 0) ? 0.5 : 1
+        }
+      }, exportingPdf ? '⏳ Đang tạo PDF...' : '📄 Xuất báo cáo PDF')
+    ),
+
+    devicesError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 10, borderRadius: 8, marginBottom: 16, fontSize: 12.5 } }, `Lỗi tải danh sách mã thiết bị: ${devicesError}`) : null,
+    exportError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 10, borderRadius: 8, marginBottom: 16, fontSize: 12.5 } }, exportError) : null,
+
+    h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12, marginBottom: 16 } },
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #2563eb' } },
+        h('div', { style: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 8 } }, '📆 So sánh các tuần trong 1 tháng'),
+        h('div', { style: { display: 'flex', gap: 6, marginBottom: 8 } },
+          h('input', {
+            type: 'number', value: monthPickMonth, min: 1, max: 12, onChange: e => setMonthPickMonth(Number(e.target.value)),
+            style: { width: 56, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 12 }
+          }),
+          h('span', { style: { color: '#94a3b8', fontSize: 12, alignSelf: 'center' } }, '/'),
+          h('input', {
+            type: 'number', value: monthPickYear, onChange: e => setMonthPickYear(Number(e.target.value)),
+            style: { width: 72, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 12 }
+          })
+        ),
+        h('button', {
+          onClick: () => addPeriods(buildWeeklyPeriods(monthPickYear, monthPickMonth)),
+          style: { background: '#2563eb', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer', width: '100%' }
+        }, '+ Thêm các tuần của tháng này')
+      ),
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #7c3aed' } },
+        h('div', { style: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 8 } }, '🗓️ So sánh nhiều tháng gần nhất'),
+        h('div', { style: { display: 'flex', gap: 6, marginBottom: 8, alignItems: 'center' } },
+          h('input', {
+            type: 'number', value: monthsBack, min: 2, max: 12, onChange: e => setMonthsBack(Number(e.target.value)),
+            style: { width: 56, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 12 }
+          }),
+          h('span', { style: { color: '#64748b', fontSize: 12 } }, 'tháng gần nhất')
+        ),
+        h('button', {
+          onClick: () => addPeriods(buildMonthlyPeriods(monthsBack)),
+          style: { background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer', width: '100%' }
+        }, '+ Thêm các tháng')
+      ),
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #0891b2' } },
+        h('div', { style: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 8 } }, '✏️ Thêm khoảng tuỳ ý'),
+        h('input', {
+          type: 'text', placeholder: 'Nhãn (VD: Đợt bảo trì T7)', value: customLabel, onChange: e => setCustomLabel(e.target.value),
+          style: { width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 12, marginBottom: 6, boxSizing: 'border-box' }
+        }),
+        h('div', { style: { display: 'flex', gap: 6, marginBottom: 8 } },
+          h('input', {
+            type: 'datetime-local', value: customFrom, onChange: e => setCustomFrom(e.target.value),
+            style: { flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 11 }
+          }),
+          h('input', {
+            type: 'datetime-local', value: customTo, onChange: e => setCustomTo(e.target.value),
+            style: { flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 11 }
+          })
+        ),
+        h('button', {
+          disabled: !customFrom || !customTo,
+          onClick: () => {
+            addPeriods([{
+              label: customLabel || fmtDateShort(new Date(customFrom).toISOString()),
+              from: new Date(customFrom).toISOString(), to: new Date(customTo).toISOString()
+            }]);
+            setCustomLabel(''); setCustomFrom(''); setCustomTo('');
+          },
+          style: {
+            background: '#0891b2', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 700,
+            cursor: (!customFrom || !customTo) ? 'not-allowed' : 'pointer', width: '100%', opacity: (!customFrom || !customTo) ? 0.5 : 1
+          }
+        }, '+ Thêm khoảng này')
+      )
+    ),
+
+    periods.length ? h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 18 } },
+      periods.map(p => h('span', {
+        key: p.id,
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: 6, background: hexToRgba(p.color, 0.12), color: p.color,
+          border: `1px solid ${hexToRgba(p.color, 0.4)}`, borderRadius: 999, padding: '5px 10px', fontSize: 12, fontWeight: 600
+        }
+      },
+        h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: p.color, display: 'inline-block' } }),
+        p.label,
+        h('button', {
+          onClick: () => removePeriod(p.id),
+          style: { border: 'none', background: 'transparent', color: p.color, cursor: 'pointer', fontWeight: 900, fontSize: 13, lineHeight: 1, padding: 0, marginLeft: 2 }
+        }, '×')
+      )),
+      h('button', {
+        onClick: clearPeriods,
+        style: { border: 'none', background: '#f1f5f9', color: '#64748b', borderRadius: 999, padding: '5px 10px', fontSize: 12, cursor: 'pointer' }
+      }, 'Xoá tất cả')
+    ) : h('div', {
+      style: { color: '#94a3b8', fontSize: 13, marginBottom: 18, textAlign: 'center', padding: 20, border: '1px dashed #cbd5e1', borderRadius: 10 }
+    }, !deviceId ? 'Nhập/chọn mã thiết bị trước, rồi thêm ít nhất 2 khoảng thời gian để so sánh.' : 'Chưa có khoảng thời gian nào — hãy thêm ít nhất 2 khoảng để so sánh.'),
+
+    (periods.length === 0 || !deviceId) ? null : h('div', { ref: reportRef },
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20, overflowX: 'auto' } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 10 } }, `Bảng so sánh — ${waterType.label} · ${metric.label} ${metric.unit ? '(' + metric.unit + ')' : ''} — Thiết bị #${deviceId}`),
+        h('table', { style: { borderCollapse: 'collapse', width: '100%', fontSize: 12.5, minWidth: 780 } },
+          h('thead', null,
+            h('tr', { style: { textAlign: 'left', color: '#64748b', borderBottom: '2px solid #e2e8f0' } },
+              ['Khoảng thời gian', 'Số điểm', 'Trung bình', 'Độ lệch chuẩn', 'CV%', 'Min', 'Max', 'Q1', 'Q3', 'IQR', '% Thiếu', metric.hasSpec ? 'Vi phạm Spec' : null]
+                .filter(Boolean).map(th => h('th', { key: th, style: { padding: '6px 10px', whiteSpace: 'nowrap' } }, th))
+            )
+          ),
+          h('tbody', null,
+            rows.map(r => h('tr', { key: r.period.id, style: { borderBottom: '1px solid #f1f5f9' } },
+              h('td', { style: { padding: '6px 10px', fontWeight: 700, color: r.period.color, whiteSpace: 'nowrap' } },
+                h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: r.period.color, display: 'inline-block', marginRight: 6 } }),
+                r.period.label
+              ),
+              r.error ? h('td', { colSpan: 10, style: { padding: '6px 10px', color: '#dc2626' } }, `Lỗi: ${r.error}`) :
+                !r.stats ? h('td', { colSpan: 10, style: { padding: '6px 10px', color: '#94a3b8' } }, 'Không có dữ liệu') :
+                  h(Fragment, null,
+                    h('td', { style: { padding: '6px 10px' } }, r.stats.totalPoints.toLocaleString('vi-VN')),
+                    h('td', { style: { padding: '6px 10px', fontWeight: 700 } }, fmtNum(r.stats.mean)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.sd)),
+                    h('td', { style: { padding: '6px 10px' } }, r.cv !== null ? `${fmtNum(r.cv, 1)}%` : '—'),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.min)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.max)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.q1)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.q3)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.iqr)),
+                    h('td', { style: { padding: '6px 10px', color: r.stats.missRate > 10 ? '#dc2626' : (r.stats.missRate > 2 ? '#d97706' : '#16a34a'), fontWeight: 700 } }, `${fmtNum(r.stats.missRate, 1)}%`),
+                    metric.hasSpec ? h('td', { style: { padding: '6px 10px', color: r.stats.specViolations > 0 ? '#dc2626' : '#16a34a', fontWeight: 700 } }, `${r.stats.specViolations} / ${r.stats.totalPoints}`) : null
+                  )
+            ))
+          )
+        )
+      ),
+
+      barData.length ? h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, 'So sánh Trung bình ± Độ lệch chuẩn giữa các kỳ'),
+        h(ResponsiveContainer, { width: '100%', height: 260 },
+          h(BarChart, { data: barData, margin: { top: 10, right: 20, left: 0, bottom: 5 } },
+            h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
+            h(XAxis, { dataKey: 'name', tick: { fontSize: 11, fill: '#64748b' } }),
+            h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 45 }),
+            h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8 }, formatter: (v) => [fmtNum(v), metric.unit] }),
+            h(Bar, { dataKey: 'mean', name: 'Trung bình', radius: [6, 6, 0, 0] },
+              barData.map((d, i) => h(Cell, { key: i, fill: d.color })),
+              h(ErrorBar, { dataKey: 'sd', width: 4, strokeWidth: 1.5, stroke: '#0f172a' })
+            )
+          )
+        )
+      ) : null,
+
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, 'Xu hướng chồng lớp (trục X = số giờ trôi qua kể từ đầu mỗi kỳ)'),
+        h(ResponsiveContainer, { width: '100%', height: 260 },
+          h(LineChart, { margin: { top: 5, right: 20, left: 0, bottom: 0 } },
+            h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
+            h(XAxis, {
+              dataKey: 'elapsedH', type: 'number', domain: [0, maxElapsed], tick: { fontSize: 10, fill: '#94a3b8' },
+              tickFormatter: (v) => `${Math.round(v)}h`
+            }),
+            h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 45, domain: ['auto', 'auto'] }),
+            h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8 }, labelFormatter: (v) => `Giờ +${fmtNum(v, 1)}`, formatter: (v, name) => [fmtNum(v), name] }),
+            h(Legend, { wrapperStyle: { fontSize: 11 } }),
+            overlaySeries.map(s => s.data.length ? h(Line, {
+              key: s.period.id, data: s.data, dataKey: 'value',
+              name: s.period.label, stroke: s.period.color, strokeWidth: 1.4, dot: false, isAnimationActive: false, connectNulls: false
+            }) : null)
+          )
+        )
+      ),
+
+      histBins.length ? h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, 'Phân phối giá trị (Histogram)'),
+        h(ResponsiveContainer, { width: '100%', height: 280 },
+          h(BarChart, { data: histBins, margin: { top: 5, right: 20, left: 0, bottom: 40 } },
+            h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
+            h(XAxis, { dataKey: 'binLabel', tick: { fontSize: 9, fill: '#94a3b8' }, angle: -35, textAnchor: 'end', height: 55, interval: 1 }),
+            h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 40 }),
+            h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8 } }),
+            h(Legend, { wrapperStyle: { fontSize: 11 } }),
+            histSeriesList.map(s => h(Bar, { key: s.id, dataKey: s.id, name: s.label, fill: s.color, radius: [3, 3, 0, 0] }))
+          )
+        )
+      ) : null
+    )
+  );
+}
+
 
 // ============================================================
 // TRANG TẢI EXCEL LÊN — đọc file .xlsx/.xls/.csv ngay trên trình duyệt (không ghi vào Supabase)
@@ -1736,7 +2201,11 @@ function TocDashboard({ session, onLogout }) {
 
         h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
       )
-    ) : (activeTab === 'compare' ? h(ComparisonPage, { devices, selectedUuid, onSelectUuid: setSelectedUuid, accessToken }) : h(ExcelImportPage)),
+        ) : (
+        activeTab === 'compare' ? h(ComparisonPage, { devices, selectedUuid, onSelectUuid: setSelectedUuid, accessToken })
+        : activeTab === 'excel' ? h(ExcelImportPage)
+        : h(UploadReportComparisonPage, { accessToken })
+      ),
 
     showChangePw ? h(ChangePasswordModal, { onClose: () => setShowChangePw(false) }) : null
   );
@@ -1750,8 +2219,9 @@ function TabNav({ activeTab, onChange }) {
     { key: 'dashboard', label: '📊 Dashboard', color: '#2563eb' },
     { key: 'compare', label: '🆚 So sánh dữ liệu', color: '#7c3aed' },
     { key: 'excel', label: '📁 Tải Excel', color: '#0d9488' },
+    { key: 'uploadCompare', label: '📑 So sánh Upload Report', color: '#b45309' },
   ];
-  return h('div', { style: { display: 'flex', gap: 8, margin: '14px 0' } },
+  return h('div', { style: { display: 'flex', gap: 8, margin: '14px 0', flexWrap: 'wrap' } },
     tabs.map(t => h('button', {
       key: t.key,
       onClick: () => onChange(t.key),
@@ -1765,6 +2235,7 @@ function TabNav({ activeTab, onChange }) {
     }, t.label))
   );
 }
+
 
 // ============================================================
 // ROOT: kiểm tra phiên đăng nhập trước khi hiện dashboard
