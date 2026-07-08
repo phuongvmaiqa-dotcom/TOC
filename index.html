@@ -54,7 +54,7 @@ import React from 'https://esm.sh/react@18.2.0';
 import ReactDOM from 'https://esm.sh/react-dom@18.2.0/client';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  ReferenceLine, Scatter, ComposedChart
+  ReferenceLine, Scatter, ComposedChart, BarChart, Bar, ErrorBar, Legend, Cell
 } from 'https://esm.sh/recharts@2.10.3?deps=react@18.2.0,react-dom@18.2.0';
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -122,6 +122,25 @@ function fmtDateShort(iso) {
   const d = new Date(iso);
   return d.toLocaleString('vi-VN', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
+
+// Chuyển hex (#rrggbb) sang rgba() với alpha cho gradient nền các thẻ số liệu
+function hexToRgba(hex, alpha) {
+  if (!hex || hex[0] !== '#') return `rgba(100,116,139,${alpha})`;
+  const h6 = hex.length === 4
+    ? '#' + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3]
+    : hex;
+  const r = parseInt(h6.slice(1, 3), 16), g = parseInt(h6.slice(3, 5), 16), b = parseInt(h6.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+// Bảng màu cố định cho từng loại số liệu thống kê — dùng xuyên suốt dashboard & trang so sánh
+const STAT_COLORS = {
+  min: '#2563eb', max: '#dc2626', mean: '#16a34a', sd: '#7c3aed',
+  q1: '#0891b2', q3: '#0d9488', iqr: '#4f46e5', miss: '#d97706', spec: '#e11d48',
+};
+
+// Bảng màu luân phiên dùng cho nhiều "khoảng thời gian" trên trang so sánh
+const PERIOD_PALETTE = ['#2563eb', '#dc2626', '#16a34a', '#d97706', '#7c3aed', '#0891b2', '#db2777', '#4b5563'];
 
 // ============================================================
 // HOOK: quản lý phiên đăng nhập Supabase Auth
@@ -331,13 +350,19 @@ function aggregateStatsRaw(allPoints, specLimit) {
 // ============================================================
 // COMPONENT: Card thống kê
 // ============================================================
-function StatCard({ label, value, unit, highlight }) {
+function StatCard({ label, value, unit, highlight, color }) {
+  const c = highlight || color || '#0f172a';
   return h('div', {
-    style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', minWidth: 92, flex: '1 1 92px' }
+    style: {
+      background: `linear-gradient(160deg, ${hexToRgba(color || '#64748b', 0.10)} 0%, #ffffff 55%)`,
+      border: '1px solid #e2e8f0', borderLeft: `3px solid ${color || '#94a3b8'}`,
+      borderRadius: 10, padding: '10px 14px', minWidth: 92, flex: '1 1 92px',
+      boxShadow: '0 1px 2px rgba(15,23,42,0.04)'
+    }
   },
-    h('div', { style: { fontSize: 11, color: '#64748b', fontWeight: 600, letterSpacing: '0.02em', textTransform: 'uppercase' } }, label),
+    h('div', { style: { fontSize: 11, color: '#64748b', fontWeight: 700, letterSpacing: '0.03em', textTransform: 'uppercase' } }, label),
     h('div', {
-      style: { fontFamily: "'JetBrains Mono', 'Courier New', monospace", fontSize: 20, fontWeight: 700, marginTop: 2, color: highlight || '#0f172a' }
+      style: { fontFamily: "'JetBrains Mono', 'Courier New', monospace", fontSize: 20, fontWeight: 800, marginTop: 2, color: c }
     },
       value,
       unit ? h('span', { style: { fontSize: 12, fontWeight: 500, color: '#64748b', marginLeft: 3 } }, unit) : null
@@ -377,27 +402,35 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
   const hasData = chartData.length > 0 && stats;
 
   const statCards = [
-    h(StatCard, { key: 'min', label: 'Min', value: fmtNum(stats?.min), unit: metric.unit }),
-    h(StatCard, { key: 'max', label: 'Max', value: fmtNum(stats?.max), unit: metric.unit }),
-    h(StatCard, { key: 'mean', label: 'Trung bình', value: fmtNum(stats?.mean), unit: metric.unit }),
-    h(StatCard, { key: 'sd', label: 'Độ lệch chuẩn', value: fmtNum(stats?.sd), unit: metric.unit }),
-    h(StatCard, { key: 'q1', label: 'Q1', value: fmtNum(stats?.q1), unit: metric.unit }),
-    h(StatCard, { key: 'q3', label: 'Q3', value: fmtNum(stats?.q3), unit: metric.unit }),
-    h(StatCard, { key: 'iqr', label: 'IQR', value: fmtNum(stats?.iqr), unit: metric.unit }),
+    h(StatCard, { key: 'min', label: 'Min', value: fmtNum(stats?.min), unit: metric.unit, color: STAT_COLORS.min }),
+    h(StatCard, { key: 'max', label: 'Max', value: fmtNum(stats?.max), unit: metric.unit, color: STAT_COLORS.max }),
+    h(StatCard, { key: 'mean', label: 'Trung bình', value: fmtNum(stats?.mean), unit: metric.unit, color: STAT_COLORS.mean }),
+    h(StatCard, { key: 'sd', label: 'Độ lệch chuẩn', value: fmtNum(stats?.sd), unit: metric.unit, color: STAT_COLORS.sd }),
+    h(StatCard, { key: 'q1', label: 'Q1', value: fmtNum(stats?.q1), unit: metric.unit, color: STAT_COLORS.q1 }),
+    h(StatCard, { key: 'q3', label: 'Q3', value: fmtNum(stats?.q3), unit: metric.unit, color: STAT_COLORS.q3 }),
+    h(StatCard, { key: 'iqr', label: 'IQR', value: fmtNum(stats?.iqr), unit: metric.unit, color: STAT_COLORS.iqr }),
     h(StatCard, {
       key: 'miss', label: '% Thiếu dữ liệu', value: fmtNum(stats?.missRate, 1),
       unit: stats ? `% (${stats.missingRows}/${stats.totalRows} dòng)` : '%',
+      color: STAT_COLORS.miss,
       highlight: stats && stats.missRate > 10 ? '#dc2626' : (stats && stats.missRate > 2 ? '#d97706' : '#16a34a')
     }),
   ];
   if (metric.hasSpec && stats) {
     statCards.push(h(StatCard, {
       key: 'spec', label: 'Vi phạm Spec', value: stats.specViolations, unit: `/ ${stats.totalPoints} điểm`,
+      color: STAT_COLORS.spec,
       highlight: stats.specViolations > 0 ? '#dc2626' : '#16a34a'
     }));
   }
 
-  return h('div', { style: { background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 12, padding: 20, marginBottom: 20 } },
+  return h('div', {
+    style: {
+      background: `linear-gradient(150deg, ${hexToRgba(waterType.accent, 0.06)} 0%, #f8fafc 40%)`,
+      border: '1px solid #e2e8f0', borderTop: `3px solid ${waterType.accent}`,
+      borderRadius: 12, padding: 20, marginBottom: 20, boxShadow: '0 1px 3px rgba(15,23,42,0.05)'
+    }
+  },
     h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 } },
       h('h3', { style: { margin: 0, fontSize: 15, fontWeight: 700, color: '#0f172a' } }, metric.label),
       h('span', { style: { fontSize: 12, color: '#94a3b8' } }, `(${metric.unit})`),
@@ -785,6 +818,375 @@ function LoginScreen() {
 // ============================================================
 // APP CHÍNH (sau khi đã đăng nhập)
 // ============================================================
+// ============================================================
+// TRANG SO SÁNH DỮ LIỆU — chọn nhiều khoảng thời gian bất kỳ và so sánh
+// (tuần trong tháng, nhiều tháng, hoặc khoảng tuỳ chọn) trên cùng biểu đồ/bảng
+// ============================================================
+function daysInMonthOf(year, month) { // month: 1-12
+  return new Date(year, month, 0).getDate();
+}
+
+function toLocalIso(year, month, day, hour, minute, second) { // month: 1-12
+  return new Date(year, month - 1, day, hour, minute, second, 0).toISOString();
+}
+
+// Chia 1 tháng thành các đoạn 7 ngày liên tiếp (Tuần 1: 1-7, Tuần 2: 8-14, ...)
+function buildWeeklyPeriods(year, month) {
+  const total = daysInMonthOf(year, month);
+  const chunks = [];
+  let start = 1, idx = 1;
+  while (start <= total) {
+    const end = Math.min(start + 6, total);
+    chunks.push({
+      label: `Tuần ${idx} (${String(start).padStart(2, '0')}-${String(end).padStart(2, '0')}/${String(month).padStart(2, '0')})`,
+      from: toLocalIso(year, month, start, 0, 0, 0),
+      to: toLocalIso(year, month, end, 23, 59, 59),
+    });
+    start = end + 1; idx += 1;
+  }
+  return chunks;
+}
+
+// N tháng gần nhất tính đến hiện tại (mỗi tháng = 1 kỳ, từ ngày 1 đến ngày cuối tháng)
+function buildMonthlyPeriods(monthsBack) {
+  const now = new Date();
+  const out = [];
+  for (let i = monthsBack - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const y = d.getFullYear(), m = d.getMonth() + 1;
+    out.push({
+      label: `Tháng ${String(m).padStart(2, '0')}/${y}`,
+      from: toLocalIso(y, m, 1, 0, 0, 0),
+      to: toLocalIso(y, m, daysInMonthOf(y, m), 23, 59, 59),
+    });
+  }
+  return out;
+}
+
+// Quy đổi mỗi điểm về "số giờ trôi qua kể từ đầu kỳ" để chồng nhiều kỳ khác ngày lên cùng 1 trục X
+function elapsedHoursSeries(points, startMs) {
+  return points.filter(p => p.value !== null).map(p => ({
+    elapsedH: (p.timeMs - startMs) / 3600000, value: p.value, time: p.time,
+  }));
+}
+
+// Gộp giá trị của nhiều kỳ vào cùng 1 bộ bin để vẽ histogram so sánh phân phối
+function buildHistogram(seriesList, binCount) {
+  const all = seriesList.flatMap(s => s.values);
+  if (!all.length) return { bins: [] };
+  const min = Math.min(...all), max = Math.max(...all);
+  const width = ((max - min) || 1) / binCount;
+  const bins = Array.from({ length: binCount }, (_, i) => {
+    const lo = min + i * width, hi = (i === binCount - 1) ? max : (min + (i + 1) * width);
+    const row = { binLabel: `${lo.toFixed(1)}–${hi.toFixed(1)}` };
+    seriesList.forEach(s => { row[s.id] = 0; });
+    return row;
+  });
+  seriesList.forEach(s => {
+    s.values.forEach(v => {
+      let idx = Math.floor((v - min) / width);
+      if (idx >= binCount) idx = binCount - 1;
+      if (idx < 0) idx = 0;
+      bins[idx][s.id] += 1;
+    });
+  });
+  return { bins };
+}
+
+// Tải song song dữ liệu thô cho tất cả các kỳ đang chọn, rồi tính thống kê từng kỳ
+function usePeriodsData(periods, uuid, waterTypeKey, metricKey, accessToken) {
+  const [dataByPeriod, setDataByPeriod] = useState({});
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!uuid || !accessToken || periods.length === 0) { setDataByPeriod({}); return; }
+    let cancelled = false;
+    setLoading(true);
+    Promise.all(periods.map(p =>
+      fetchAllRows(uuid, p.from, p.to, accessToken)
+        .then(rows => {
+          const points = extractSeries(rows, waterTypeKey, metricKey);
+          const specLimit = metricKey === 'toc' ? TOC_SPEC_LIMIT : null;
+          const stats = aggregateStatsRaw(points, specLimit);
+          return [p.id, { points, stats, error: null }];
+        })
+        .catch(err => [p.id, { points: [], stats: null, error: err.message || String(err) }])
+    )).then(entries => {
+      if (cancelled) return;
+      setDataByPeriod(Object.fromEntries(entries));
+      setLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [periods, uuid, waterTypeKey, metricKey, accessToken]);
+
+  return { dataByPeriod, loading };
+}
+
+function ComparisonPage({ devices, selectedUuid, onSelectUuid, accessToken }) {
+  const [periods, setPeriods] = useState([]);
+  const [waterTypeKey, setWaterTypeKey] = useState('distilled');
+  const [metricKey, setMetricKey] = useState('toc');
+  const metric = METRICS.find(m => m.key === metricKey) || METRICS[0];
+  const waterType = WATER_TYPES.find(w => w.key === waterTypeKey) || WATER_TYPES[0];
+
+  const [monthPickYear, setMonthPickYear] = useState(new Date().getFullYear());
+  const [monthPickMonth, setMonthPickMonth] = useState(new Date().getMonth() + 1);
+  const [monthsBack, setMonthsBack] = useState(3);
+  const [customLabel, setCustomLabel] = useState('');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+
+  const addPeriods = useCallback((defs) => {
+    setPeriods(prev => {
+      const added = defs.map((d, i) => ({
+        id: `p_${Date.now()}_${i}_${Math.random().toString(36).slice(2, 7)}`,
+        label: d.label, from: d.from, to: d.to,
+        color: PERIOD_PALETTE[(prev.length + i) % PERIOD_PALETTE.length],
+      }));
+      return [...prev, ...added];
+    });
+  }, []);
+
+  const removePeriod = (id) => setPeriods(prev => prev.filter(p => p.id !== id));
+  const clearPeriods = () => setPeriods([]);
+
+  const { dataByPeriod, loading } = usePeriodsData(periods, selectedUuid, waterTypeKey, metricKey, accessToken);
+
+  const rows = useMemo(() => periods.map(p => {
+    const d = dataByPeriod[p.id];
+    const stats = d?.stats;
+    const cv = (stats && stats.mean) ? (stats.sd / Math.abs(stats.mean)) * 100 : null;
+    return { period: p, stats, cv, error: d?.error };
+  }), [periods, dataByPeriod]);
+
+  const barData = useMemo(() => rows.filter(r => r.stats).map(r => ({
+    name: r.period.label, mean: r.stats.mean, sd: r.stats.sd, color: r.period.color
+  })), [rows]);
+
+  const overlaySeries = useMemo(() => periods.map(p => {
+    const d = dataByPeriod[p.id];
+    if (!d || !d.points || !d.points.length) return { period: p, data: [] };
+    const firstValid = d.points.find(pt => pt.value !== null) || d.points[0];
+    return { period: p, data: elapsedHoursSeries(d.points, firstValid.timeMs) };
+  }), [periods, dataByPeriod]);
+
+  const maxElapsed = useMemo(() => {
+    let m = 1;
+    overlaySeries.forEach(s => { if (s.data.length) m = Math.max(m, s.data[s.data.length - 1].elapsedH); });
+    return m;
+  }, [overlaySeries]);
+
+  const histSeriesList = useMemo(() => periods.map(p => {
+    const d = dataByPeriod[p.id];
+    return { id: p.id, label: p.label, color: p.color, values: (d?.points || []).filter(pt => pt.value !== null).map(pt => pt.value) };
+  }).filter(s => s.values.length), [periods, dataByPeriod]);
+
+  const { bins: histBins } = useMemo(() => buildHistogram(histSeriesList, 16), [histSeriesList]);
+
+  return h('div', { style: { marginTop: 4 } },
+    h('div', {
+      style: {
+        background: 'linear-gradient(120deg, #0f172a, #1e1b4b)', borderRadius: 12, padding: '16px 20px',
+        display: 'flex', flexWrap: 'wrap', gap: 14, alignItems: 'center', marginBottom: 16
+      }
+    },
+      h('span', { style: { color: '#fff', fontWeight: 700, fontSize: 14 } }, '🆚 So sánh dữ liệu'),
+      h('select', {
+        value: selectedUuid || '', onChange: (e) => onSelectUuid(e.target.value),
+        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, devices.map(d => h('option', { key: d.uuid, value: d.uuid }, `${d.location_name || d.model || d.uuid} (${d.uuid})`))),
+      h('select', {
+        value: waterTypeKey, onChange: (e) => setWaterTypeKey(e.target.value),
+        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, WATER_TYPES.map(w => h('option', { key: w.key, value: w.key }, w.label))),
+      h('select', {
+        value: metricKey, onChange: (e) => setMetricKey(e.target.value),
+        style: { background: '#1e293b', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 10px', fontSize: 13 }
+      }, METRICS.map(m => h('option', { key: m.key, value: m.key }, `${m.label} (${m.unit})`))),
+      loading ? h('span', { style: { color: '#38bdf8', fontSize: 12 } }, '⏳ Đang tải...') : null
+    ),
+
+    h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 12, marginBottom: 16 } },
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #2563eb' } },
+        h('div', { style: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 8 } }, '📆 So sánh các tuần trong 1 tháng'),
+        h('div', { style: { display: 'flex', gap: 6, marginBottom: 8 } },
+          h('input', {
+            type: 'number', value: monthPickMonth, min: 1, max: 12, onChange: e => setMonthPickMonth(Number(e.target.value)),
+            style: { width: 56, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 12 }
+          }),
+          h('span', { style: { color: '#94a3b8', fontSize: 12, alignSelf: 'center' } }, '/'),
+          h('input', {
+            type: 'number', value: monthPickYear, onChange: e => setMonthPickYear(Number(e.target.value)),
+            style: { width: 72, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 12 }
+          })
+        ),
+        h('button', {
+          onClick: () => addPeriods(buildWeeklyPeriods(monthPickYear, monthPickMonth)),
+          style: { background: '#2563eb', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer', width: '100%' }
+        }, '+ Thêm các tuần của tháng này')
+      ),
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #7c3aed' } },
+        h('div', { style: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 8 } }, '🗓️ So sánh nhiều tháng gần nhất'),
+        h('div', { style: { display: 'flex', gap: 6, marginBottom: 8, alignItems: 'center' } },
+          h('input', {
+            type: 'number', value: monthsBack, min: 2, max: 12, onChange: e => setMonthsBack(Number(e.target.value)),
+            style: { width: 56, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 12 }
+          }),
+          h('span', { style: { color: '#64748b', fontSize: 12 } }, 'tháng gần nhất')
+        ),
+        h('button', {
+          onClick: () => addPeriods(buildMonthlyPeriods(monthsBack)),
+          style: { background: '#7c3aed', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 700, cursor: 'pointer', width: '100%' }
+        }, '+ Thêm các tháng')
+      ),
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, borderTop: '3px solid #0891b2' } },
+        h('div', { style: { fontSize: 12, fontWeight: 700, color: '#0f172a', marginBottom: 8 } }, '✏️ Thêm khoảng tuỳ ý'),
+        h('input', {
+          type: 'text', placeholder: 'Nhãn (VD: Đợt bảo trì T7)', value: customLabel, onChange: e => setCustomLabel(e.target.value),
+          style: { width: '100%', border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 8px', fontSize: 12, marginBottom: 6, boxSizing: 'border-box' }
+        }),
+        h('div', { style: { display: 'flex', gap: 6, marginBottom: 8 } },
+          h('input', {
+            type: 'datetime-local', value: customFrom, onChange: e => setCustomFrom(e.target.value),
+            style: { flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 11 }
+          }),
+          h('input', {
+            type: 'datetime-local', value: customTo, onChange: e => setCustomTo(e.target.value),
+            style: { flex: 1, border: '1px solid #cbd5e1', borderRadius: 6, padding: '5px 6px', fontSize: 11 }
+          })
+        ),
+        h('button', {
+          disabled: !customFrom || !customTo,
+          onClick: () => {
+            addPeriods([{
+              label: customLabel || fmtDateShort(new Date(customFrom).toISOString()),
+              from: new Date(customFrom).toISOString(), to: new Date(customTo).toISOString()
+            }]);
+            setCustomLabel(''); setCustomFrom(''); setCustomTo('');
+          },
+          style: {
+            background: '#0891b2', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 12px', fontSize: 12, fontWeight: 700,
+            cursor: (!customFrom || !customTo) ? 'not-allowed' : 'pointer', width: '100%', opacity: (!customFrom || !customTo) ? 0.5 : 1
+          }
+        }, '+ Thêm khoảng này')
+      )
+    ),
+
+    periods.length ? h('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 18 } },
+      periods.map(p => h('span', {
+        key: p.id,
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: 6, background: hexToRgba(p.color, 0.12), color: p.color,
+          border: `1px solid ${hexToRgba(p.color, 0.4)}`, borderRadius: 999, padding: '5px 10px', fontSize: 12, fontWeight: 600
+        }
+      },
+        h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: p.color, display: 'inline-block' } }),
+        p.label,
+        h('button', {
+          onClick: () => removePeriod(p.id),
+          style: { border: 'none', background: 'transparent', color: p.color, cursor: 'pointer', fontWeight: 900, fontSize: 13, lineHeight: 1, padding: 0, marginLeft: 2 }
+        }, '×')
+      )),
+      h('button', {
+        onClick: clearPeriods,
+        style: { border: 'none', background: '#f1f5f9', color: '#64748b', borderRadius: 999, padding: '5px 10px', fontSize: 12, cursor: 'pointer' }
+      }, 'Xoá tất cả')
+    ) : h('div', {
+      style: { color: '#94a3b8', fontSize: 13, marginBottom: 18, textAlign: 'center', padding: 20, border: '1px dashed #cbd5e1', borderRadius: 10 }
+    }, 'Chưa có khoảng thời gian nào — hãy thêm ít nhất 2 khoảng để so sánh.'),
+
+    periods.length === 0 ? null : h(Fragment, null,
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20, overflowX: 'auto' } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 10 } }, `Bảng so sánh — ${waterType.label} · ${metric.label} (${metric.unit})`),
+        h('table', { style: { borderCollapse: 'collapse', width: '100%', fontSize: 12.5, minWidth: 780 } },
+          h('thead', null,
+            h('tr', { style: { textAlign: 'left', color: '#64748b', borderBottom: '2px solid #e2e8f0' } },
+              ['Khoảng thời gian', 'Số điểm', 'Trung bình', 'Độ lệch chuẩn', 'CV%', 'Min', 'Max', 'Q1', 'Q3', 'IQR', '% Thiếu', metric.hasSpec ? 'Vi phạm Spec' : null]
+                .filter(Boolean).map(th => h('th', { key: th, style: { padding: '6px 10px', whiteSpace: 'nowrap' } }, th))
+            )
+          ),
+          h('tbody', null,
+            rows.map(r => h('tr', { key: r.period.id, style: { borderBottom: '1px solid #f1f5f9' } },
+              h('td', { style: { padding: '6px 10px', fontWeight: 700, color: r.period.color, whiteSpace: 'nowrap' } },
+                h('span', { style: { width: 8, height: 8, borderRadius: '50%', background: r.period.color, display: 'inline-block', marginRight: 6 } }),
+                r.period.label
+              ),
+              r.error ? h('td', { colSpan: 10, style: { padding: '6px 10px', color: '#dc2626' } }, `Lỗi: ${r.error}`) :
+                !r.stats ? h('td', { colSpan: 10, style: { padding: '6px 10px', color: '#94a3b8' } }, 'Không có dữ liệu') :
+                  h(Fragment, null,
+                    h('td', { style: { padding: '6px 10px' } }, r.stats.totalPoints.toLocaleString('vi-VN')),
+                    h('td', { style: { padding: '6px 10px', fontWeight: 700 } }, fmtNum(r.stats.mean)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.sd)),
+                    h('td', { style: { padding: '6px 10px' } }, r.cv !== null ? `${fmtNum(r.cv, 1)}%` : '—'),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.min)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.max)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.q1)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.q3)),
+                    h('td', { style: { padding: '6px 10px' } }, fmtNum(r.stats.iqr)),
+                    h('td', { style: { padding: '6px 10px', color: r.stats.missRate > 10 ? '#dc2626' : (r.stats.missRate > 2 ? '#d97706' : '#16a34a'), fontWeight: 700 } }, `${fmtNum(r.stats.missRate, 1)}%`),
+                    metric.hasSpec ? h('td', { style: { padding: '6px 10px', color: r.stats.specViolations > 0 ? '#dc2626' : '#16a34a', fontWeight: 700 } }, `${r.stats.specViolations} / ${r.stats.totalPoints}`) : null
+                  )
+            ))
+          )
+        )
+      ),
+
+      barData.length ? h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, 'So sánh Trung bình ± Độ lệch chuẩn giữa các kỳ'),
+        h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 8 } }, 'Cột càng cao = trung bình càng lớn; thanh sai số càng dài = dữ liệu càng biến động (SD lớn)'),
+        h(ResponsiveContainer, { width: '100%', height: 260 },
+          h(BarChart, { data: barData, margin: { top: 10, right: 20, left: 0, bottom: 5 } },
+            h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
+            h(XAxis, { dataKey: 'name', tick: { fontSize: 11, fill: '#64748b' } }),
+            h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 45 }),
+            h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8 }, formatter: (v) => [fmtNum(v), metric.unit] }),
+            h(Bar, { dataKey: 'mean', name: 'Trung bình', radius: [6, 6, 0, 0] },
+              barData.map((d, i) => h(Cell, { key: i, fill: d.color })),
+              h(ErrorBar, { dataKey: 'sd', width: 4, strokeWidth: 1.5, stroke: '#0f172a' })
+            )
+          )
+        )
+      ) : null,
+
+      h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, 'Xu hướng chồng lớp (trục X = số giờ trôi qua kể từ đầu mỗi kỳ)'),
+        h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 8 } }, 'So sánh hình dạng xu hướng của các kỳ khác ngày/tháng trên cùng một hệ trục'),
+        h(ResponsiveContainer, { width: '100%', height: 260 },
+          h(LineChart, { margin: { top: 5, right: 20, left: 0, bottom: 0 } },
+            h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
+            h(XAxis, {
+              dataKey: 'elapsedH', type: 'number', domain: [0, maxElapsed], tick: { fontSize: 10, fill: '#94a3b8' },
+              tickFormatter: (v) => `${Math.round(v)}h`
+            }),
+            h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 45, domain: ['auto', 'auto'] }),
+            h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8 }, labelFormatter: (v) => `Giờ +${fmtNum(v, 1)}`, formatter: (v, name) => [fmtNum(v), name] }),
+            h(Legend, { wrapperStyle: { fontSize: 11 } }),
+            overlaySeries.map(s => s.data.length ? h(Line, {
+              key: s.period.id, data: s.data, dataKey: 'value',
+              name: s.period.label, stroke: s.period.color, strokeWidth: 1.4, dot: false, isAnimationActive: false, connectNulls: false
+            }) : null)
+          )
+        )
+      ),
+
+      histBins.length ? h('div', { style: { background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: 16, marginBottom: 20 } },
+        h('div', { style: { fontSize: 13, fontWeight: 700, color: '#0f172a', marginBottom: 4 } }, 'Phân phối giá trị (Histogram)'),
+        h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 8 } }, 'So sánh hình dạng phân phối — lệch phải/trái, độ tập trung quanh trung bình, các đuôi bất thường'),
+        h(ResponsiveContainer, { width: '100%', height: 280 },
+          h(BarChart, { data: histBins, margin: { top: 5, right: 20, left: 0, bottom: 40 } },
+            h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
+            h(XAxis, { dataKey: 'binLabel', tick: { fontSize: 9, fill: '#94a3b8' }, angle: -35, textAnchor: 'end', height: 55, interval: 1 }),
+            h(YAxis, { tick: { fontSize: 10, fill: '#94a3b8' }, width: 40 }),
+            h(Tooltip, { contentStyle: { fontSize: 12, borderRadius: 8 } }),
+            h(Legend, { wrapperStyle: { fontSize: 11 } }),
+            histSeriesList.map(s => h(Bar, { key: s.id, dataKey: s.id, name: s.label, fill: s.color, radius: [3, 3, 0, 0] }))
+          )
+        )
+      ) : null
+    )
+  );
+}
+
 function TocDashboard({ session, onLogout }) {
   const accessToken = session.access_token;
   const userEmail = session.user?.email || '';
@@ -796,6 +1198,7 @@ function TocDashboard({ session, onLogout }) {
   const [customTo, setCustomTo] = useState('');
   const [showChangePw, setShowChangePw] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
+  const [activeTab, setActiveTab] = useState('dashboard'); // 'dashboard' | 'compare'
 
   useEffect(() => {
     if (devices.length && !selectedUuid) setSelectedUuid(devices[0].uuid);
@@ -865,7 +1268,11 @@ function TocDashboard({ session, onLogout }) {
   const waterSections = selectedUuid ? WATER_TYPES.map(wt =>
     h('div', { key: wt.key, style: { marginBottom: 32 } },
       h('h2', {
-        style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 18, fontWeight: 800, color: wt.accent, borderBottom: `2px solid ${wt.accent}`, paddingBottom: 8, marginBottom: 16 }
+        style: {
+          display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 15, fontWeight: 800, color: '#fff',
+          background: `linear-gradient(120deg, ${wt.accent} 0%, ${hexToRgba(wt.accent, 0.72)} 100%)`,
+          padding: '8px 16px', borderRadius: 999, marginBottom: 16, boxShadow: `0 2px 8px ${hexToRgba(wt.accent, 0.35)}`
+        }
       }, wt.label),
       METRICS.map(m => h(MetricBlock, {
         key: `${wt.key}_${m.key}`, waterType: wt, metric: m,
@@ -880,34 +1287,66 @@ function TocDashboard({ session, onLogout }) {
         `⏳ Khoảng thời gian dài (~${expCount.toLocaleString('vi-VN')} điểm kỳ vọng/thông số) — biểu đồ vẽ từng điểm thật có thể tải chậm vài giây.`)
     : null;
 
-  return h('div', { style: { background: '#fff', minHeight: '100vh', padding: 20, color: '#0f172a' } },
+  return h('div', {
+    style: {
+      background: 'linear-gradient(180deg, #eef2ff 0%, #f8fafc 220px, #f8fafc 100%)',
+      minHeight: '100vh', padding: 20, color: '#0f172a'
+    }
+  },
     h(AccountBar, {
       email: userEmail, onLogout: handleLogout, loggingOut,
       onOpenChangePassword: () => setShowChangePw(true)
     }),
 
-    h(FilterBar, {
-      devices, selectedUuid, onSelectUuid: setSelectedUuid,
-      rangeKey, onRangeChange: setRangeKey,
-      customFrom, customTo, onCustomChange: handleCustomChange,
-      onRefresh: refresh, loading,
-      onSendReport: handleSendReport, reportStatus
-    }),
+    h(TabNav, { activeTab, onChange: setActiveTab }),
 
-    h('div', { style: { marginTop: 20 } },
-      bigRangeWarning,
-      devicesError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải danh sách thiết bị: ${devicesError}`) : null,
-      error ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải dữ liệu: ${error}`) : null,
-      devicesLoading ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Đang tải danh sách thiết bị...') : null,
-      (!devicesLoading && devices.length === 0 && !devicesError) ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Chưa có thiết bị nào trong hệ thống. Hãy chạy workflow đồng bộ devices trước.') : null,
-      (!loading && loadedCount > 0) ? h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 12 } }, `Đã tải ${loadedCount.toLocaleString('vi-VN')} điểm đo thô từ ${fmtDateShort(fromIso)} đến ${fmtDateShort(toIso)}`) : null,
+    activeTab === 'dashboard' ? h(Fragment, null,
+      h(FilterBar, {
+        devices, selectedUuid, onSelectUuid: setSelectedUuid,
+        rangeKey, onRangeChange: setRangeKey,
+        customFrom, customTo, onCustomChange: handleCustomChange,
+        onRefresh: refresh, loading,
+        onSendReport: handleSendReport, reportStatus
+      }),
 
-      waterSections,
+      h('div', { style: { marginTop: 20 } },
+        bigRangeWarning,
+        devicesError ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải danh sách thiết bị: ${devicesError}`) : null,
+        error ? h('div', { style: { background: '#fef2f2', color: '#dc2626', padding: 12, borderRadius: 8, marginBottom: 16, fontSize: 13 } }, `Lỗi tải dữ liệu: ${error}`) : null,
+        devicesLoading ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Đang tải danh sách thiết bị...') : null,
+        (!devicesLoading && devices.length === 0 && !devicesError) ? h('div', { style: { textAlign: 'center', color: '#94a3b8', padding: 40 } }, 'Chưa có thiết bị nào trong hệ thống. Hãy chạy workflow đồng bộ devices trước.') : null,
+        (!loading && loadedCount > 0) ? h('div', { style: { fontSize: 11, color: '#94a3b8', marginBottom: 12 } }, `Đã tải ${loadedCount.toLocaleString('vi-VN')} điểm đo thô từ ${fmtDateShort(fromIso)} đến ${fmtDateShort(toIso)}`) : null,
 
-      h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
-    ),
+        waterSections,
+
+        h('div', { style: { textAlign: 'center', color: '#cbd5e1', fontSize: 11, marginTop: 20, paddingTop: 16, borderTop: '1px solid #f1f5f9' } }, 'Dữ liệu thô (1 phút/lần) từ Supabase · Cập nhật tự động mỗi giờ qua n8n')
+      )
+    ) : h(ComparisonPage, { devices, selectedUuid, onSelectUuid: setSelectedUuid, accessToken }),
 
     showChangePw ? h(ChangePasswordModal, { onClose: () => setShowChangePw(false) }) : null
+  );
+}
+
+// ============================================================
+// COMPONENT: thanh chuyển tab Dashboard / So sánh dữ liệu
+// ============================================================
+function TabNav({ activeTab, onChange }) {
+  const tabs = [
+    { key: 'dashboard', label: '📊 Dashboard', color: '#2563eb' },
+    { key: 'compare', label: '🆚 So sánh dữ liệu', color: '#7c3aed' },
+  ];
+  return h('div', { style: { display: 'flex', gap: 8, margin: '14px 0' } },
+    tabs.map(t => h('button', {
+      key: t.key,
+      onClick: () => onChange(t.key),
+      style: {
+        border: 'none', cursor: 'pointer', fontSize: 13, fontWeight: 700, padding: '9px 18px', borderRadius: 999,
+        background: activeTab === t.key ? `linear-gradient(120deg, ${t.color}, ${hexToRgba(t.color, 0.75)})` : '#e2e8f0',
+        color: activeTab === t.key ? '#fff' : '#475569',
+        boxShadow: activeTab === t.key ? `0 3px 10px ${hexToRgba(t.color, 0.35)}` : 'none',
+        transition: 'all .15s ease'
+      }
+    }, t.label))
   );
 }
 
