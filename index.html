@@ -1124,20 +1124,105 @@ function buildWeeklyPeriods(year, month) {
 }
 
 // N tháng gần nhất tính đến hiện tại (mỗi tháng = 1 kỳ, từ ngày 1 đến ngày cuối tháng)
-function buildMonthlyPeriods(monthsBack) {
-  const now = new Date();
-  const out = [];
-  for (let i = monthsBack - 1; i >= 0; i--) {
-    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-    const y = d.getFullYear(), m = d.getMonth() + 1;
-    out.push({
-      label: `Tháng ${String(m).padStart(2, '0')}/${y}`,
-      from: toLocalIso(y, m, 1, 0, 0, 0),
-      to: toLocalIso(y, m, daysInMonthOf(y, m), 23, 59, 59),
-    });
+import React, { useState } from "react";
+
+function MonthSelector() {
+  const months = Array.from({ length: 12 }, (_, i) => ({
+    value: i + 1,
+    label: `Tháng ${i + 1}`,
+  }));
+
+  const [selectedMonths, setSelectedMonths] = useState([]);
+
+  const toggleMonth = (month) => {
+    setSelectedMonths((prev) =>
+      prev.includes(month)
+        ? prev.filter((m) => m !== month)
+        : [...prev, month]
+    );
+  };
+
+  function buildMonthlyPeriods(selectedMonths, year = new Date().getFullYear()) {
+    return selectedMonths
+      .sort((a, b) => a - b)
+      .map((month) => ({
+        month,
+        year,
+        label: `Tháng ${String(month).padStart(2, "0")}/${year}`,
+        from: toLocalIso(year, month, 1, 0, 0, 0),
+        to: toLocalIso(
+          year,
+          month,
+          daysInMonthOf(year, month),
+          23,
+          59,
+          59
+        ),
+      }));
   }
-  return out;
+
+  const handleLoad = () => {
+    const periods = buildMonthlyPeriods(selectedMonths);
+
+    console.log(periods);
+
+    // Thay bằng hàm lấy dữ liệu của bạn
+    // Ví dụ:
+    // loadData(periods);
+  };
+
+  return (
+    <div style={{ padding: "20px" }}>
+      <h3>Chọn tháng cần lấy dữ liệu</h3>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(4, 1fr)",
+          gap: "10px",
+          marginBottom: "20px",
+        }}
+      >
+        {months.map((item) => (
+          <label key={item.value}>
+            <input
+              type="checkbox"
+              checked={selectedMonths.includes(item.value)}
+              onChange={() => toggleMonth(item.value)}
+            />
+            {" "}
+            {item.label}
+          </label>
+        ))}
+      </div>
+
+      <button
+        onClick={() =>
+          setSelectedMonths([1,2,3,4,5,6,7,8,9,10,11,12])
+        }
+      >
+        Chọn tất cả
+      </button>
+
+      <button
+        style={{ marginLeft: "10px" }}
+        onClick={() => setSelectedMonths([])}
+      >
+        Bỏ chọn
+      </button>
+
+      <button
+        style={{ marginLeft: "10px" }}
+        onClick={handleLoad}
+      >
+        Lấy dữ liệu
+      </button>
+    </div>
+  );
 }
+
+export default MonthSelector;
+
 
 // Quy đổi mỗi điểm về "số giờ trôi qua kể từ đầu kỳ" để chồng nhiều kỳ khác ngày lên cùng 1 trục X
 function elapsedHoursSeries(points, startMs) {
