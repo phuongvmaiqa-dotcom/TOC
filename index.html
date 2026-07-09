@@ -470,9 +470,12 @@ function parseNumericText(raw) {
   return Number.isNaN(n) ? null : n;
 }
 
-// Các cột thực sự dùng tới trong bảng "TOC upload report" (giảm dung lượng phản hồi)
+// Các cột thực sự dùng tới trong bảng "TOC upload report" (giảm dung lượng phản hồi).
+// LƯU Ý: tên cột ở bảng này có khoảng trắng/dấu ngoặc/tiếng Việt có dấu, nên PostgREST
+// bắt buộc phải bọc trong dấu ngoặc kép ("...") trong tham số select, nếu không sẽ bị lỗi
+// "PGRST100 failed to parse select parameter".
 const UPLOAD_SELECT_COLS = [UPLOAD_COL_TIME, ...Object.values(UPLOAD_FIELD_MAP)]
-  .map(encodeURIComponent).join(',');
+  .map(c => encodeURIComponent(`"${c}"`)).join(',');
 
 async function fetchAllRowsUpload(deviceId, fromIso, toIso, accessToken) {
   const headers = buildHeaders(accessToken);
