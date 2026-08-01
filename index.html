@@ -366,7 +366,7 @@ async function fetchPagedParallel(buildUrl, headers, expectedRows, options = {})
 // Các cột thực sự dùng tới trong bảng toc_data_raw (bỏ bớt các cột thừa như id/uuid/created_at
 // để giảm dung lượng phản hồi từ Supabase — có ảnh hưởng rõ với các khoảng thời gian dài)
 const RAW_DATA_SELECT_COLS = [
-  'device_timestamp', 'dw_toc', 'dw_conductivity', 'dw_temperature',
+  'recorded_at', 'dw_toc', 'dw_conductivity', 'dw_temperature',
   'pw_toc', 'pw_conductivity', 'pw_temperature',
 ].join(',');
 
@@ -378,11 +378,19 @@ async function fetchAllRows(uuid, fromIso, toIso, accessToken) {
   const headers = buildHeaders(accessToken);
   const buildUrl = (offset, limit) =>
     `${REST_BASE}/toc_data_raw?uuid=eq.${encodeURIComponent(uuid)}` +
-    `&device_timestamp=gte.${encodeURIComponent(fromIso)}` +
-    `&device_timestamp=lte.${encodeURIComponent(toIso)}` +
+    `&recorded_at=gte.${encodeURIComponent(fromIso)}` +
+    `&recorded_at=lte.${encodeURIComponent(toIso)}` +
     `&select=${RAW_DATA_SELECT_COLS}` +
-    `&order=device_timestamp.asc&limit=${limit}&offset=${offset}`;
-  return fetchPagedParallel(buildUrl, headers, expectedCount(fromIso, toIso));
+    `&order=recorded_at.asc&limit=${limit}&offset=${offset}`;
+  const rows = await fetchPagedParallel(buildUrl, headers, expectedCount(fromIso, toIso));
+
+  // Lọc phòng thủ: loại bỏ dòng lệch ra ngoài khoảng đã chọn (đề phòng lệch múi giờ)
+  const fromMs = new Date(fromIso).getTime();
+  const toMs = new Date(toIso).getTime();
+  return rows.filter(r => {
+    const t = new Date(r.recorded_at).getTime();
+    return t >= fromMs && t <= toMs;
+  });
 }
 
 
@@ -616,9 +624,9 @@ function extractSeries(rawRows, waterType, metricKey) {
   for (const r of rawRows) {
     const v = r[field];
     points.push({
-      time: r.device_timestamp,
-      timeMs: new Date(r.device_timestamp).getTime(),
-      timeLabel: fmtDateShort(r.device_timestamp),
+      time: r.recorded_at,
+      timeMs: new Date(r.recorded_at).getTime(),
+      timeLabel: fmtDateShort(r.recorded_at),
       value: (v === null || v === undefined) ? null : Number(v),
     });
   }
@@ -724,6 +732,7 @@ function downsampleForChart(data, maxPoints = 2000) {
     let minIdx = null, maxIdx = null;
     for (let j = i; j < end; j++) {
       const v = data[j].value;
+      if (data[j].isGap) pushUnique(j); 
       if (data[j].violation !== null && data[j].violation !== undefined) pushUnique(j);
       if (v === null || v === undefined) continue;
       if (minIdx === null || v < data[minIdx].value) minIdx = j;
@@ -741,7 +750,7 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
 
   const chartData = useMemo(() => {
     if (!points || !stats) return [];
-    return points.filter(p => p.value !== null).map(p => ({
+    return points.filter(p => p.isGap ? p : ({
       time: p.time,
       timeMs: p.timeMs,
       timeLabel: p.timeLabel,
