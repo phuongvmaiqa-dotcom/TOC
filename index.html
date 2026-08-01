@@ -746,20 +746,44 @@ function downsampleForChart(data, maxPoints = 2000) {
 }
 
 function MetricBlock({ waterType, metric, points, specLimit, loading }) {
+  // Ghi 1 điểm/phút — nếu 2 điểm liền kề cách nhau quá ngưỡng này thì coi là mất dữ liệu, ngắt đường nối
+const TREND_GAP_THRESHOLD_MS = 5 * 60 * 1000; // 5 phút, chỉnh nếu muốn ngưỡng khác
+
+function buildGappedSeries(points, gapThresholdMs) {
+  if (!points || !points.length) return [];
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (i > 0 && p.timeMs - points[i - 1].timeMs > gapThresholdMs) {
+      out.push({ time: null, timeMs: points[i - 1].timeMs + 1, timeLabel: null, value: null, isGap: true });
+    }
+    out.push(p);
+  }
+  return out;
+}
   const stats = useMemo(() => aggregateStatsRaw(points, metric.hasSpec ? specLimit : null), [points, specLimit]);
 
-  const chartData = useMemo(() => {
-    if (!points || !stats) return [];
-    return points.filter(p => p.isGap ? p : ({
-      time: p.time,
-      timeMs: p.timeMs,
-      timeLabel: p.timeLabel,
-      value: p.value,
-      ucl: stats.ucl,
-      lcl: stats.lcl,
-      violation: (metric.hasSpec && specLimit !== null && p.value > specLimit) ? p.value : null,
-    }));
-  }, [points, stats, metric.hasSpec, specLimit]);
+  // Dữ liệu đầy đủ (bao gồm cả điểm gap, value:null) — dùng cho Trend chart
+const chartData = useMemo(() => {
+  if (!points || !stats) return [];
+  return points.map(p => ({
+    time: p.time,
+    timeMs: p.timeMs,
+    timeLabel: p.timeLabel,
+    value: p.isGap ? null : p.value,
+    // UCL/LCL luôn gán, kể cả tại điểm gap, để đường giới hạn liên tục
+    ucl: stats.ucl,
+    lcl: stats.lcl,
+    violation: (!p.isGap && metric.hasSpec && specLimit !== null && p.value > specLimit) ? p.value : null,
+    isGap: !!p.isGap,
+  }));
+}, [points, stats, metric.hasSpec, specLimit]);
+
+// Dữ liệu chỉ gồm điểm thật — dùng riêng cho Control chart (loại bỏ hẳn điểm gap)
+const controlChartData = useMemo(
+  () => chartData.filter(p => !p.isGap),
+  [chartData]
+);
 
   const timeDomain = useMemo(() => {
     if (!chartData.length) return [0, 1];
@@ -768,7 +792,7 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
 
   // Dữ liệu THẬT dùng để vẽ (đã giảm mẫu nếu quá nhiều điểm) — số liệu thống kê phía trên
   // vẫn luôn được tính trên `points`/`chartData` đầy đủ, không bị ảnh hưởng.
-  const displayChartData = useMemo(() => downsampleForChart(chartData, 2000), [chartData]);
+  const displayChartData = useMemo(() => downsampleForChart(controlChartData, 2000), [controlChartData]);
 
   const tickFormatterTime = (ms) => {
     const d = new Date(ms);
@@ -850,7 +874,7 @@ function MetricBlock({ waterType, metric, points, specLimit, loading }) {
       h('div', null,
         h('div', { style: { fontSize: 12, fontWeight: 600, color: '#475569', marginBottom: 6 } }, 'Biểu đồ kiểm soát (Control Chart — UCL/LCL = mean ± 3σ, tính trên toàn bộ khoảng đã chọn)'),
         h(ResponsiveContainer, { width: '100%', height: 220 },
-          h(ComposedChart, { data: displayChartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
+          h(ComposedChart, { data: displayControlChartData, margin: { top: 5, right: 10, left: 0, bottom: 0 } },
             h(CartesianGrid, { strokeDasharray: '3 3', stroke: '#e2e8f0' }),
             h(XAxis, {
               dataKey: 'timeMs', type: 'number', domain: timeDomain, scale: 'time',
