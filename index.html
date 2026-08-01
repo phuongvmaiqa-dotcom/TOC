@@ -716,7 +716,22 @@ function StatCard({ label, value, unit, highlight, color }) {
 // bị đơ/chậm sau khi tải xong dữ liệu, đặc biệt với khoảng 7 ngày / 30 ngày.
 // Mỗi "bucket" giữ lại điểm min & max (giữ được đỉnh/đáy thật của dữ liệu) và LUÔN giữ lại
 // mọi điểm vi phạm spec để không bị mất cảnh báo trên biểu đồ.
-function downsampleForChart(data, maxPoints = 2000) {
+// Ghi 1 điểm/phút — nếu 2 điểm liền kề cách nhau quá ngưỡng này thì coi là mất dữ liệu, ngắt đường nối
+const TREND_GAP_THRESHOLD_MS = 5 * 60 * 1000; // 5 phút, chỉnh nếu muốn ngưỡng khác
+
+function buildGappedSeries(points, gapThresholdMs) {
+  if (!points || !points.length) return [];
+  const out = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    if (i > 0 && p.timeMs - points[i - 1].timeMs > gapThresholdMs) {
+      out.push({ time: null, timeMs: points[i - 1].timeMs + 1, timeLabel: null, value: null, isGap: true });
+    }
+    out.push(p);
+  }
+  return out;
+}
+  function downsampleForChart(data, maxPoints = 2000) {
   if (!data || data.length <= maxPoints) return data;
   const bucketCount = Math.max(1, Math.floor(maxPoints / 2));
   const bucketSize = Math.ceil(data.length / bucketCount);
